@@ -1,0 +1,483 @@
+//@version=6
+strategy("SIRTS v10", overlay=true, pyramiding=0, initial_capital=10000,
+         default_qty_type=strategy.percent_of_equity, default_qty_value=100,
+         commission_type=strategy.commission.percent, commission_value=0.1)
+
+// ═══════════════════════════════════════════════════════════════════════
+// CONSTANTS & CONFIGURATION
+// ═══════════════════════════════════════════════════════════════════════
+
+// Alert Messages (Constants)
+ALERT_SMC_BOS_BULL  = "SMC: Bullish Break of Structure Detected"
+ALERT_SMC_BOS_BEAR  = "SMC: Bearish Break of Structure Detected"
+ALERT_SMC_CHOCH_BULL = "SMC: Bullish Change of Character Detected"
+ALERT_SMC_CHOCH_BEAR = "SMC: Bearish Change of Character Detected"
+ALERT_CRT_ASIA_BREAK_BULL = "CRT: Bullish Asia Range Breakout"
+ALERT_CRT_ASIA_BREAK_BEAR = "CRT: Bearish Asia Range Breakout"
+ALERT_TURTLE_FAKE_BULL = "Turtle Soup: Bullish False Breakout Confirmed"
+ALERT_TURTLE_FAKE_BEAR = "Turtle Soup: Bearish False Breakout Confirmed"
+ALERT_ENTRY_LONG = "SIRTS v10: LONG Entry Signal"
+ALERT_ENTRY_SHORT = "SIRTS v10: SHORT Entry Signal"
+
+// Strategy Module Toggles
+enable_smc = input.bool(true, "Enable SMC Module", group="Strategy Modules")
+enable_crt = input.bool(true, "Enable CRT Module", group="Strategy Modules")
+enable_turtle = input.bool(true, "Enable Turtle Soup Module", group="Strategy Modules")
+
+// Multi-Timeframe Settings
+mtf_15m_enabled = input.bool(true, "15m Confirmation", group="Multi-Timeframe")
+mtf_1h_enabled = input.bool(true, "1H Confirmation", group="Multi-Timeframe")
+mtf_4h_enabled = input.bool(true, "4H Confirmation", group="Multi-Timeframe")
+
+// Risk Management
+atr_period = input.int(14, "ATR Period", minval=1, group="Risk Management")
+atr_sl_mult = input.float(1.5, "ATR SL Multiplier", minval=0.1, step=0.1, group="Risk Management")
+tp1_rr = input.float(1.0, "TP1 Risk:Reward", minval=0.1, step=0.1, group="Risk Management")
+tp2_rr = input.float(2.0, "TP2 Risk:Reward", minval=0.1, step=0.1, group="Risk Management")
+tp3_rr = input.float(3.0, "TP3 Risk:Reward", minval=0.1, step=0.1, group="Risk Management")
+risk_percent = input.float(2.0, "Risk % per Trade", minval=0.1, maxval=10, step=0.1, group="Risk Management")
+
+// SMC Settings
+smc_swing_length = input.int(10, "Swing Detection Length", minval=5, group="SMC Settings")
+smc_ob_lookback = input.int(20, "Order Block Lookback", minval=5, group="SMC Settings")
+
+// CRT Settings
+crt_asia_start = input.int(0, "Asia Session Start (UTC)", minval=0, maxval=23, group="CRT Settings")
+crt_asia_end = input.int(8, "Asia Session End (UTC)", minval=0, maxval=23, group="CRT Settings")
+crt_london_start = input.int(8, "London Start (UTC)", minval=0, maxval=23, group="CRT Settings")
+crt_london_end = input.int(12, "London End (UTC)", minval=0, maxval=23, group="CRT Settings")
+crt_ny_start = input.int(12, "NY Start (UTC)", minval=0, maxval=23, group="CRT Settings")
+crt_ny_end = input.int(20, "NY End (UTC)", minval=0, maxval=23, group="CRT Settings")
+
+// Turtle Soup Settings
+turtle_period = input.int(20, "Turtle Period", minval=10, group="Turtle Soup Settings")
+turtle_confirm_bars = input.int(3, "Confirmation Bars", minval=1, maxval=5, group="Turtle Soup Settings")
+
+// Display Settings
+show_ob_boxes = input.bool(true, "Show Order Blocks", group="Display")
+show_20d_levels = input.bool(true, "Show 20D High/Low", group="Display")
+show_signals = input.bool(true, "Show Entry Signals", group="Display")
+
+// Colors
+color_smc = input.color(color.new(color.blue, 0), "SMC Signal Color", group="Display")
+color_crt = input.color(color.new(color.orange, 0), "CRT Signal Color", group="Display")
+color_turtle = input.color(color.new(color.purple, 0), "Turtle Signal Color", group="Display")
+color_ob_bull = input.color(color.new(color.green, 80), "Bull Order Block", group="Display")
+color_ob_bear = input.color(color.new(color.red, 80), "Bear Order Block", group="Display")
+
+// ═══════════════════════════════════════════════════════════════════════
+// LAYER 1: EXECUTE - UNCONDITIONAL CALCULATIONS
+// ═══════════════════════════════════════════════════════════════════════
+
+// --- MULTI-TIMEFRAME DATA (Always Execute) ---
+tf_15m = "15"
+tf_1h = "60"
+tf_4h = "240"
+
+// Request security data unconditionally
+[mtf_15m_close, mtf_15m_high, mtf_15m_low, mtf_15m_open] = request.security(syminfo.tickerid, tf_15m, [close, high, low, open], lookahead=barmerge.lookahead_off)
+[mtf_1h_close, mtf_1h_high, mtf_1h_low, mtf_1h_open] = request.security(syminfo.tickerid, tf_1h, [close, high, low, open], lookahead=barmerge.lookahead_off)
+[mtf_4h_close, mtf_4h_high, mtf_4h_low, mtf_4h_open] = request.security(syminfo.tickerid, tf_4h, [close, high, low, open], lookahead=barmerge.lookahead_off)
+
+// --- TECHNICAL INDICATORS (Always Execute) ---
+
+// ATR Calculation (unconditional)
+atr_value = ta.atr(atr_period)
+atr_valid = not na(atr_value) and atr_value > 0
+
+// EMAs for Bias Detection
+ema20 = ta.ema(close, 20)
+ema50 = ta.ema(close, 50)
+ema_bias_bull = ema20 > ema50
+ema_bias_bear = ema20 < ema50
+
+// Volume Analysis
+vol_ma = ta.sma(volume, 20)
+vol_spike = volume > vol_ma * 1.3
+
+// --- SMC MODULE CALCULATIONS (Always Execute) ---
+
+// Market Structure Detection
+var float last_hh = na
+var float last_hl = na
+var float last_ll = na
+var float last_lh = na
+var int structure_state = 0  // 1=uptrend, -1=downtrend, 0=neutral
+
+// Swing High/Low Detection
+swing_high = ta.pivothigh(high, smc_swing_length, smc_swing_length)
+swing_low = ta.pivotlow(low, smc_swing_length, smc_swing_length)
+
+// Update structure state
+if not na(swing_high)
+    if na(last_hh) or swing_high > last_hh
+        last_hh := swing_high
+        structure_state := 1
+    else if swing_high < last_lh or (not na(last_lh) and swing_high < last_hh)
+        last_lh := swing_high
+        structure_state := -1
+
+if not na(swing_low)
+    if na(last_ll) or swing_low < last_ll
+        last_ll := swing_low
+        structure_state := -1
+    else if swing_low > last_hl or (not na(last_hl) and swing_low > last_ll)
+        last_hl := swing_low
+        structure_state := 1
+
+// Break of Structure (BOS) Detection
+bos_bull = structure_state == 1 and close > last_hh and not na(last_hh)
+bos_bear = structure_state == -1 and close < last_ll and not na(last_ll)
+
+// Change of Character (CHoCH) Detection
+choch_bull = structure_state == -1 and close > last_lh and not na(last_lh)
+choch_bear = structure_state == 1 and close < last_hl and not na(last_hl)
+
+// Order Block Detection
+var float ob_bull_top = na
+var float ob_bull_bottom = na
+var float ob_bear_top = na
+var float ob_bear_bottom = na
+var int ob_bull_bar = na
+var int ob_bear_bar = na
+
+// Find last down candle before bullish move in uptrend
+if structure_state == 1 and close > open
+    for i = 1 to smc_ob_lookback
+        if close[i] < open[i]  // Down candle
+            ob_bull_top := high[i]
+            ob_bull_bottom := low[i]
+            ob_bull_bar := bar_index - i
+            break
+
+// Find last up candle before bearish move in downtrend
+if structure_state == -1 and close < open
+    for i = 1 to smc_ob_lookback
+        if close[i] > open[i]  // Up candle
+            ob_bear_top := high[i]
+            ob_bear_bottom := low[i]
+            ob_bear_bar := bar_index - i
+            break
+
+// Liquidity Sweep Detection
+var float prev_high = na
+var float prev_low = na
+var bool liq_sweep_high = false
+var bool liq_sweep_low = false
+
+if not na(swing_high)
+    prev_high := swing_high
+
+if not na(swing_low)
+    prev_low := swing_low
+
+// Sweep = price breaks level then quickly retraces
+liq_sweep_high := not na(prev_high) and high > prev_high and close < prev_high
+liq_sweep_low := not na(prev_low) and low < prev_low and close > prev_low
+
+// SMC Signals
+smc_long_signal = (bos_bull or choch_bull) and ema_bias_bull and vol_spike and not na(ob_bull_top)
+smc_short_signal = (bos_bear or choch_bear) and ema_bias_bear and vol_spike and not na(ob_bear_top)
+
+// --- CRT MODULE CALCULATIONS (Always Execute) ---
+
+// Current hour (UTC)
+current_hour = hour(time, "UTC")
+
+// Session identification
+is_asia_session = current_hour >= crt_asia_start and current_hour < crt_asia_end
+is_london_session = current_hour >= crt_london_start and current_hour < crt_london_end
+is_ny_session = current_hour >= crt_ny_start and current_hour < crt_ny_end
+
+// Asia Range Tracking
+var float asia_high = na
+var float asia_low = na
+var bool asia_range_set = false
+
+// Reset at start of Asia session
+if is_asia_session and not is_asia_session[1]
+    asia_high := high
+    asia_low := low
+    asia_range_set := false
+
+// Update during Asia session
+if is_asia_session
+    asia_high := math.max(nz(asia_high, high), high)
+    asia_low := math.min(nz(asia_low, low), low)
+
+// Mark range as set at end of Asia session
+if not is_asia_session and is_asia_session[1]
+    asia_range_set := true
+
+// CRT Breakout Signals (London/NY sessions)
+crt_long_signal = asia_range_set and (is_london_session or is_ny_session) and
+                   close > asia_high and close[1] <= asia_high and vol_spike
+
+crt_short_signal = asia_range_set and (is_london_session or is_ny_session) and
+                    close < asia_low and close[1] >= asia_low and vol_spike
+
+// --- TURTLE SOUP MODULE CALCULATIONS (Always Execute) ---
+
+// 20-period High/Low
+turtle_high = ta.highest(high, turtle_period)
+turtle_low = ta.lowest(low, turtle_period)
+
+// Breakout detection
+var bool turtle_break_high = false
+var bool turtle_break_low = false
+var int turtle_break_bar = 0
+
+// Detect initial breakout
+if high > turtle_high[1] and not turtle_break_high
+    turtle_break_high := true
+    turtle_break_low := false
+    turtle_break_bar := bar_index
+
+if low < turtle_low[1] and not turtle_break_low
+    turtle_break_low := true
+    turtle_break_high := false
+    turtle_break_bar := bar_index
+
+// False breakout confirmation (price returns within range within N bars)
+bars_since_break = bar_index - turtle_break_bar
+turtle_false_high = turtle_break_high and bars_since_break > 0 and
+                     bars_since_break <= turtle_confirm_bars and
+                     close < turtle_high[1]
+
+turtle_false_low = turtle_break_low and bars_since_break > 0 and
+                    bars_since_break <= turtle_confirm_bars and
+                    close > turtle_low[1]
+
+// Reset break flags after confirmation or timeout
+if turtle_false_high or turtle_false_low or bars_since_break > turtle_confirm_bars
+    turtle_break_high := false
+    turtle_break_low := false
+
+// Turtle Soup Signals (reverse direction of false breakout)
+turtle_long_signal = turtle_false_low and ema_bias_bull and vol_spike
+turtle_short_signal = turtle_false_high and ema_bias_bear and vol_spike
+
+// ═══════════════════════════════════════════════════════════════════════
+// LAYER 2: VALIDATE - SIGNAL PRIORITIZATION & CONFIRMATION
+// ═══════════════════════════════════════════════════════════════════════
+
+// Signal Priority: SMC > CRT > Turtle Soup
+final_long_signal = false
+final_short_signal = false
+signal_source = ""
+
+// Apply module toggles and priority
+if enable_smc and smc_long_signal
+    final_long_signal := true
+    signal_source := "SMC"
+else if enable_smc and smc_short_signal
+    final_short_signal := true
+    signal_source := "SMC"
+else if enable_crt and crt_long_signal
+    final_long_signal := true
+    signal_source := "CRT"
+else if enable_crt and crt_short_signal
+    final_short_signal := true
+    signal_source := "CRT"
+else if enable_turtle and turtle_long_signal
+    final_long_signal := true
+    signal_source := "TURTLE"
+else if enable_turtle and turtle_short_signal
+    final_short_signal := true
+    signal_source := "TURTLE"
+
+// Multi-Timeframe Confirmation
+mtf_trend_bull = true
+mtf_trend_bear = true
+
+if mtf_15m_enabled
+    mtf_15m_bull = mtf_15m_close > ta.ema(mtf_15m_close, 20)
+    mtf_15m_bear = mtf_15m_close < ta.ema(mtf_15m_close, 20)
+    mtf_trend_bull := mtf_trend_bull and mtf_15m_bull
+    mtf_trend_bear := mtf_trend_bear and mtf_15m_bear
+
+if mtf_1h_enabled
+    mtf_1h_bull = mtf_1h_close > ta.ema(mtf_1h_close, 20)
+    mtf_1h_bear = mtf_1h_close < ta.ema(mtf_1h_close, 20)
+    mtf_trend_bull := mtf_trend_bull and mtf_1h_bull
+    mtf_trend_bear := mtf_trend_bear and mtf_1h_bear
+
+if mtf_4h_enabled
+    mtf_4h_bull = mtf_4h_close > ta.ema(mtf_4h_close, 50)
+    mtf_4h_bear = mtf_4h_close < ta.ema(mtf_4h_close, 50)
+    mtf_trend_bull := mtf_trend_bull and mtf_4h_bull
+    mtf_trend_bear := mtf_trend_bear and mtf_4h_bear
+
+// Apply MTF filter to final signals
+confirmed_long = final_long_signal and mtf_trend_bull
+confirmed_short = final_short_signal and mtf_trend_bear
+
+// Calculate Entry, SL, and TPs
+entry_price = close
+sl_distance = atr_value * atr_sl_mult
+
+stop_loss_long = entry_price - sl_distance
+stop_loss_short = entry_price + sl_distance
+
+tp1_long = entry_price + (sl_distance * tp1_rr)
+tp2_long = entry_price + (sl_distance * tp2_rr)
+tp3_long = entry_price + (sl_distance * tp3_rr)
+
+tp1_short = entry_price - (sl_distance * tp1_rr)
+tp2_short = entry_price - (sl_distance * tp2_rr)
+tp3_short = entry_price - (sl_distance * tp3_rr)
+
+// Position Sizing (simplified)
+position_size = (strategy.equity * (risk_percent / 100)) / sl_distance
+
+// ═══════════════════════════════════════════════════════════════════════
+// LAYER 3: DISPLAY - VISUAL OUTPUT & ALERTS
+// ═══════════════════════════════════════════════════════════════════════
+
+// --- Order Block Visualization ---
+if show_ob_boxes
+    // Bullish Order Block
+    if not na(ob_bull_bar) and bar_index - ob_bull_bar < 100
+        box.new(ob_bull_bar, ob_bull_top, bar_index + 20, ob_bull_bottom,
+                border_color=color.new(color.green, 50),
+                bgcolor=color_ob_bull,
+                border_width=1)
+
+    // Bearish Order Block
+    if not na(ob_bear_bar) and bar_index - ob_bear_bar < 100
+        box.new(ob_bear_bar, ob_bear_top, bar_index + 20, ob_bear_bottom,
+                border_color=color.new(color.red, 50),
+                bgcolor=color_ob_bear,
+                border_width=1)
+
+// --- 20D High/Low Lines ---
+plot(show_20d_levels ? turtle_high : na, "20D High", color=color.new(color.red, 50), linewidth=2, style=plot.style_linebr)
+plot(show_20d_levels ? turtle_low : na, "20D Low", color=color.new(color.green, 50), linewidth=2, style=plot.style_linebr)
+
+// --- Asia Range Visualization ---
+bgcolor(is_asia_session ? color.new(color.yellow, 95) : na, title="Asia Session")
+bgcolor(is_london_session ? color.new(color.blue, 95) : na, title="London Session")
+bgcolor(is_ny_session ? color.new(color.orange, 95) : na, title="NY Session")
+
+plot(asia_range_set ? asia_high : na, "Asia High", color=color.new(color.orange, 30), linewidth=1, style=plot.style_stepline)
+plot(asia_range_set ? asia_low : na, "Asia Low", color=color.new(color.orange, 30), linewidth=1, style=plot.style_stepline)
+
+// --- Entry Signals on Chart ---
+plotshape(show_signals and confirmed_long, "Long Entry", shape.triangleup, location.belowbar,
+          signal_source == "SMC" ? color_smc : signal_source == "CRT" ? color_crt : color_turtle,
+          size=size.normal)
+
+plotshape(show_signals and confirmed_short, "Short Entry", shape.triangledown, location.abovebar,
+          signal_source == "SMC" ? color_smc : signal_source == "CRT" ? color_crt : color_turtle,
+          size=size.normal)
+
+// --- Session Indicator (Subplot) ---
+session_value = is_asia_session ? 1 : is_london_session ? 2 : is_ny_session ? 3 : 0
+plot(session_value, "Active Session", color=color.new(color.gray, 0), display=display.none)
+
+// Session labels at bottom
+var label asia_label = na
+var label london_label = na
+var label ny_label = na
+
+if is_asia_session and not is_asia_session[1]
+    label.delete(asia_label)
+    asia_label := label.new(bar_index, low, "ASIA", color=color.new(color.yellow, 70),
+                            textcolor=color.black, style=label.style_label_up, size=size.small)
+
+if is_london_session and not is_london_session[1]
+    label.delete(london_label)
+    london_label := label.new(bar_index, low, "LONDON", color=color.new(color.blue, 70),
+                              textcolor=color.white, style=label.style_label_up, size=size.small)
+
+if is_ny_session and not is_ny_session[1]
+    label.delete(ny_label)
+    ny_label := label.new(bar_index, low, "NY", color=color.new(color.orange, 70),
+                          textcolor=color.white, style=label.style_label_up, size=size.small)
+
+// ═══════════════════════════════════════════════════════════════════════
+// STRATEGY EXECUTION
+// ═══════════════════════════════════════════════════════════════════════
+
+// Entry Conditions
+if confirmed_long and atr_valid and strategy.position_size == 0
+    strategy.entry("LONG", strategy.long, qty=position_size,
+                   comment=signal_source + " LONG")
+    strategy.exit("TP1", "LONG", limit=tp1_long, stop=stop_loss_long, qty_percent=33)
+    strategy.exit("TP2", "LONG", limit=tp2_long, stop=stop_loss_long, qty_percent=33)
+    strategy.exit("TP3", "LONG", limit=tp3_long, stop=stop_loss_long)
+
+if confirmed_short and atr_valid and strategy.position_size == 0
+    strategy.entry("SHORT", strategy.short, qty=position_size,
+                   comment=signal_source + " SHORT")
+    strategy.exit("TP1", "SHORT", limit=tp1_short, stop=stop_loss_short, qty_percent=33)
+    strategy.exit("TP2", "SHORT", limit=tp2_short, stop=stop_loss_short, qty_percent=33)
+    strategy.exit("TP3", "SHORT", limit=tp3_short, stop=stop_loss_short)
+
+// ═══════════════════════════════════════════════════════════════════════
+// ALERTS
+// ═══════════════════════════════════════════════════════════════════════
+
+// SMC Alerts
+alertcondition(bos_bull, title="SMC BOS Bullish", message=ALERT_SMC_BOS_BULL)
+alertcondition(bos_bear, title="SMC BOS Bearish", message=ALERT_SMC_BOS_BEAR)
+alertcondition(choch_bull, title="SMC CHoCH Bullish", message=ALERT_SMC_CHOCH_BULL)
+alertcondition(choch_bear, title="SMC CHoCH Bearish", message=ALERT_SMC_CHOCH_BEAR)
+
+// CRT Alerts
+alertcondition(crt_long_signal, title="CRT Bullish Breakout", message=ALERT_CRT_ASIA_BREAK_BULL)
+alertcondition(crt_short_signal, title="CRT Bearish Breakout", message=ALERT_CRT_ASIA_BREAK_BEAR)
+
+// Turtle Soup Alerts
+alertcondition(turtle_long_signal, title="Turtle Soup Bullish", message=ALERT_TURTLE_FAKE_BULL)
+alertcondition(turtle_short_signal, title="Turtle Soup Bearish", message=ALERT_TURTLE_FAKE_BEAR)
+
+// Entry Alerts
+alertcondition(confirmed_long, title="LONG Entry Signal", message=ALERT_ENTRY_LONG)
+alertcondition(confirmed_short, title="SHORT Entry Signal", message=ALERT_ENTRY_SHORT)
+
+// ═══════════════════════════════════════════════════════════════════════
+// INFO TABLE (Optional Performance Display)
+// ═══════════════════════════════════════════════════════════════════════
+
+var table info_table = table.new(position.top_right, 2, 8, border_width=1)
+
+if barstate.islast
+    table.cell(info_table, 0, 0, "SIRTS v10", bgcolor=color.new(color.gray, 70), text_color=color.white)
+    table.cell(info_table, 1, 0, "Active", bgcolor=color.new(color.green, 70), text_color=color.white)
+
+    table.cell(info_table, 0, 1, "SMC", text_color=color.white)
+    table.cell(info_table, 1, 1, enable_smc ? "ON" : "OFF",
+               bgcolor=enable_smc ? color.new(color.green, 70) : color.new(color.red, 70),
+               text_color=color.white)
+
+    table.cell(info_table, 0, 2, "CRT", text_color=color.white)
+    table.cell(info_table, 1, 2, enable_crt ? "ON" : "OFF",
+               bgcolor=enable_crt ? color.new(color.green, 70) : color.new(color.red, 70),
+               text_color=color.white)
+
+    table.cell(info_table, 0, 3, "Turtle", text_color=color.white)
+    table.cell(info_table, 1, 3, enable_turtle ? "ON" : "OFF",
+               bgcolor=enable_turtle ? color.new(color.green, 70) : color.new(color.red, 70),
+               text_color=color.white)
+
+    table.cell(info_table, 0, 4, "Trend", text_color=color.white)
+    table.cell(info_table, 1, 4, ema_bias_bull ? "BULL" : ema_bias_bear ? "BEAR" : "NEUTRAL",
+               bgcolor=ema_bias_bull ? color.new(color.green, 70) : ema_bias_bear ? color.new(color.red, 70) : color.new(color.gray, 70),
+               text_color=color.white)
+
+    table.cell(info_table, 0, 5, "Session", text_color=color.white)
+    table.cell(info_table, 1, 5, is_asia_session ? "ASIA" : is_london_session ? "LONDON" : is_ny_session ? "NY" : "OFF",
+               text_color=color.white)
+
+    table.cell(info_table, 0, 6, "ATR", text_color=color.white)
+    table.cell(info_table, 1, 6, str.tostring(atr_value, format.mintick), text_color=color.white)
+
+    table.cell(info_table, 0, 7, "Signal", text_color=color.white)
+    table.cell(info_table, 1, 7, signal_source != "" ? signal_source : "NONE",
+               bgcolor=signal_source != "" ? color.new(color.blue, 70) : color.new(color.gray, 70),
+               text_color=color.white)
+
+// ═══════════════════════════════════════════════════════════════════════
+// END OF STRATEGY
+// ═══════════════════════════════════════════════════════════════════════
