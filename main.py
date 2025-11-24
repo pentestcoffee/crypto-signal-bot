@@ -646,7 +646,7 @@ def generate_signal(symbol):
                 best_tf = tf
                 print(f"   💾 NEW BEST SIGNAL: {direction} at {best_signal['entry']}")
 
-    if best_signal and best_confidence >= 60:
+    if best_signal and best_confidence >= 40:
         print(f"\n🎉 ✅ SIGNAL GENERATED: {symbol} {best_signal['direction']} | Confidence: {best_confidence:.1f}%")
         return process_romeoptp_signal(best_signal)
     elif best_signal:
@@ -706,7 +706,27 @@ def analyze_symbol(symbol):
     print(f"🎯 ROMEOPTP SCANNING {symbol}...")
     return generate_signal(symbol)
 
-# Update main loop printing to be cleaner
+# ===== STARTUP =====
+init_csv()
+send_message("🚀 ROMEOPTP LIQUIDITY MANIPULATION ENGINE DEPLOYED\n"
+             "🎯 Pure Price-Based Analysis | No EMA/Trend Filters\n"
+             "🔧 CRT + Turtle Soup + BOS/MSS + Order Blocks\n"
+             "⚡ Liquidity Targeting & Sweep Detection Active\n"
+             "📊 Detailed Logging Enabled - Monitoring 70 Symbols")
+
+try:
+    SYMBOLS = get_top_symbols(70)
+    print(f"🚀 ROMEOPTP ENGINE STARTED")
+    print(f"📊 Monitoring {len(SYMBOLS)} symbols")
+    print(f"🎯 Timeframes: {', '.join(TIMEFRAMES)}")
+    print(f"🔧 Pure Price Manipulation Analysis")
+    print(f"📈 Detailed logging enabled")
+    print(f"{'='*60}")
+except Exception as e:
+    SYMBOLS = ["BTCUSDT","ETHUSDT"]
+    print("Warning retrieving top symbols, defaulting to BTCUSDT & ETHUSDT.")
+
+# ===== MAIN LOOP =====
 while True:
     try:
         # Check for BTC volatility spikes
