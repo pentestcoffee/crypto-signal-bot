@@ -257,6 +257,8 @@ def detect_crt_range(df, lookback=50):
     low_touches = len(equal_lows)
     quality_score = min((high_touches + low_touches) / (lookback * 0.1), 1.0)
     
+    print(f"      🔍 CRT Analysis: {high_touches} high touches, {low_touches} low touches")
+    
     if high_touches >= 2 and low_touches >= 2:
         return high_max, low_min, quality_score
     else:
@@ -577,6 +579,224 @@ def btc_volatility_spike(window=20, threshold=2.0):
         print(f"❌ BTC volatility check error: {e}")
         return False
 
+# ===== MISSING FUNCTIONS ADDED =====
+def process_romeoptp_signal(signal):
+    """
+    🔥 PROCESS ROMEOPTP SIGNAL: Execute trade based on Romeoptp signal
+    """
+    global signals_sent_total, open_trades, last_trade_time
+    
+    symbol = signal['symbol']
+    direction = signal['direction']
+    entry_price = signal['entry']
+    confidence = signal['confidence']
+    
+    print(f"🎯 PROCESSING ROMEOPTP SIGNAL: {symbol} {direction} at {entry_price}")
+    
+    # Calculate position sizing
+    risk_pct = min(max(BASE_RISK * (confidence / 100), MIN_RISK), MAX_RISK)
+    margin_usd = CAPITAL * risk_pct
+    exposure_usd = margin_usd * LEVERAGE
+    
+    # Calculate TP/SL levels
+    if direction == "BUY":
+        sl_price = entry_price * (1 - 0.01)  # 1% SL
+        tp1 = entry_price * (1 + 0.005)      # 0.5% TP1
+        tp2 = entry_price * (1 + 0.01)       # 1% TP2  
+        tp3 = entry_price * (1 + 0.015)      # 1.5% TP3
+    else:  # SELL
+        sl_price = entry_price * (1 + 0.01)  # 1% SL
+        tp1 = entry_price * (1 - 0.005)      # 0.5% TP1
+        tp2 = entry_price * (1 - 0.01)       # 1% TP2
+        tp3 = entry_price * (1 - 0.015)      # 1.5% TP3
+    
+    # Create trade object
+    trade = {
+        "s": symbol,
+        "side": direction,
+        "entry": entry_price,
+        "sl": sl_price,
+        "tp1": tp1,
+        "tp2": tp2, 
+        "tp3": tp3,
+        "entry_tf": signal['timeframe'],
+        "margin": margin_usd,
+        "exposure": exposure_usd,
+        "risk_pct": risk_pct,
+        "confidence_pct": confidence,
+        "st": "open",
+        "opened_at": time.time()
+    }
+    
+    # Add to open trades
+    open_trades.append(trade)
+    
+    # Update cooldown
+    last_trade_time[symbol] = time.time() + COOLDOWN_TIME_SUCCESS
+    
+    # Update stats
+    signals_sent_total += 1
+    STATS["by_side"][direction]["sent"] += 1
+    STATS["by_tf"][signal['timeframe']]["sent"] += 1
+    
+    # Send Telegram alert
+    message = (
+        f"🎯 ROMEOPTP SIGNAL\n"
+        f"Symbol: {symbol} {direction}\n"
+        f"Entry: {entry_price:.4f}\n" 
+        f"TP: {tp1:.4f} / {tp2:.4f} / {tp3:.4f}\n"
+        f"SL: {sl_price:.4f}\n"
+        f"Risk: {risk_pct*100:.1f}% | Confidence: {confidence:.1f}%\n"
+        f"TF: {signal['timeframe']} | Margin: ${margin_usd:.2f}"
+    )
+    send_message(message)
+    
+    # Log to CSV
+    log_signal([
+        datetime.utcnow().isoformat(), symbol, direction, entry_price, 
+        tp1, tp2, tp3, sl_price, signal['timeframe'], 
+        "N/A", margin_usd, exposure_usd, risk_pct*100, confidence, "open", "Romeoptp"
+    ])
+    
+    return True
+
+def check_trades():
+    """
+    🔥 CHECK OPEN TRADES FOR TP/SL
+    """
+    global open_trades, signals_hit_total, signals_fail_total, signals_breakeven
+    
+    current_time = time.time()
+    still_open = []
+    
+    for trade in open_trades:
+        symbol = trade["s"]
+        current_price = get_price(symbol)
+        
+        if current_price is None:
+            still_open.append(trade)
+            continue
+            
+        direction = trade["side"]
+        entry = trade["entry"]
+        sl = trade["sl"]
+        tp1, tp2, tp3 = trade["tp1"], trade["tp2"], trade["tp3"]
+        
+        # Check for TP/SL
+        if direction == "BUY":
+            if current_price <= sl:
+                # Stop loss hit
+                trade["st"] = "closed"
+                trade["close_reason"] = "SL"
+                trade["closed_at"] = current_time
+                signals_fail_total += 1
+                STATS["by_side"][direction]["fail"] += 1
+                STATS["by_tf"][trade["entry_tf"]]["fail"] += 1
+                send_message(f"❌ SL HIT: {symbol} BUY | Entry: {entry:.4f} | Current: {current_price:.4f}")
+            elif current_price >= tp3:
+                # All TPs hit
+                trade["st"] = "closed" 
+                trade["close_reason"] = "TP3"
+                trade["closed_at"] = current_time
+                signals_hit_total += 1
+                STATS["by_side"][direction]["hit"] += 1
+                STATS["by_tf"][trade["entry_tf"]]["hit"] += 1
+                send_message(f"🎉 TP3 HIT: {symbol} BUY | Entry: {entry:.4f} | Current: {current_price:.4f}")
+            elif current_price >= tp2:
+                # TP2 hit
+                trade["st"] = "closed"
+                trade["close_reason"] = "TP2"
+                trade["closed_at"] = current_time
+                signals_hit_total += 1
+                STATS["by_side"][direction]["hit"] += 1
+                STATS["by_tf"][trade["entry_tf"]]["hit"] += 1
+                send_message(f"✅ TP2 HIT: {symbol} BUY | Entry: {entry:.4f} | Current: {current_price:.4f}")
+            elif current_price >= tp1:
+                # TP1 hit
+                trade["st"] = "closed"
+                trade["close_reason"] = "TP1"
+                trade["closed_at"] = current_time
+                signals_hit_total += 1
+                STATS["by_side"][direction]["hit"] += 1
+                STATS["by_tf"][trade["entry_tf"]]["hit"] += 1
+                send_message(f"✅ TP1 HIT: {symbol} BUY | Entry: {entry:.4f} | Current: {current_price:.4f}")
+            else:
+                still_open.append(trade)
+                
+        else:  # SELL
+            if current_price >= sl:
+                # Stop loss hit
+                trade["st"] = "closed"
+                trade["close_reason"] = "SL"
+                trade["closed_at"] = current_time
+                signals_fail_total += 1
+                STATS["by_side"][direction]["fail"] += 1
+                STATS["by_tf"][trade["entry_tf"]]["fail"] += 1
+                send_message(f"❌ SL HIT: {symbol} SELL | Entry: {entry:.4f} | Current: {current_price:.4f}")
+            elif current_price <= tp3:
+                # All TPs hit
+                trade["st"] = "closed"
+                trade["close_reason"] = "TP3"
+                trade["closed_at"] = current_time
+                signals_hit_total += 1
+                STATS["by_side"][direction]["hit"] += 1
+                STATS["by_tf"][trade["entry_tf"]]["hit"] += 1
+                send_message(f"🎉 TP3 HIT: {symbol} SELL | Entry: {entry:.4f} | Current: {current_price:.4f}")
+            elif current_price <= tp2:
+                # TP2 hit
+                trade["st"] = "closed"
+                trade["close_reason"] = "TP2"
+                trade["closed_at"] = current_time
+                signals_hit_total += 1
+                STATS["by_side"][direction]["hit"] += 1
+                STATS["by_tf"][trade["entry_tf"]]["hit"] += 1
+                send_message(f"✅ TP2 HIT: {symbol} SELL | Entry: {entry:.4f} | Current: {current_price:.4f}")
+            elif current_price <= tp1:
+                # TP1 hit
+                trade["st"] = "closed"
+                trade["close_reason"] = "TP1"
+                trade["closed_at"] = current_time
+                signals_hit_total += 1
+                STATS["by_side"][direction]["hit"] += 1
+                STATS["by_tf"][trade["entry_tf"]]["hit"] += 1
+                send_message(f"✅ TP1 HIT: {symbol} SELL | Entry: {entry:.4f} | Current: {current_price:.4f}")
+            else:
+                still_open.append(trade)
+    
+    # Log closed trades
+    for trade in open_trades:
+        if trade.get("st") == "closed" and not trade.get("logged"):
+            log_trade_close(trade)
+            trade["logged"] = True
+    
+    # Update open trades list
+    open_trades = [t for t in still_open if t.get("st") == "open"]
+
+def heartbeat():
+    """Send periodic heartbeat"""
+    open_count = len([t for t in open_trades if t.get("st") == "open"])
+    message = (
+        f"❤️ ROMEOPTP HEARTBEAT\n"
+        f"Cycles: {cycle_count}\n"
+        f"Open Trades: {open_count}\n"
+        f"Signals: {signals_sent_total} sent, {signals_hit_total} hits\n"
+        f"Active: {len(SYMBOLS)} symbols"
+    )
+    send_message(message)
+
+def summary():
+    """Send daily summary"""
+    hit_rate = (signals_hit_total / signals_sent_total * 100) if signals_sent_total > 0 else 0
+    message = (
+        f"📊 ROMEOPTP DAILY SUMMARY\n"
+        f"Signals: {signals_sent_total} sent\n"
+        f"Hits: {signals_hit_total} | Fails: {signals_fail_total}\n"
+        f"Hit Rate: {hit_rate:.1f}%\n"
+        f"Total Scans: {total_checked_signals}\n"
+        f"Skipped: {skipped_signals}"
+    )
+    send_message(message)
+
 # ===== ROMEOPTP SIGNAL GENERATION WITH DETAILED LOGGING =====
 def generate_signal(symbol):
     """
@@ -600,18 +820,25 @@ def generate_signal(symbol):
             print(f"   ❌ SKIP: No data or insufficient bars")
             continue
         
+        # Check dataframe structure
+        required_columns = ['open', 'high', 'low', 'close']
+        if not all(col in df.columns for col in required_columns):
+            print(f"   ❌ SKIP: Missing required columns. Available: {list(df.columns)}")
+            continue
+            
         current_price = df['close'].iloc[-1]
-        print(f"   💰 Current Price: {current_price:.1f}")
-        print(f"   📈 Data Range: {len(df)} bars from {df['timestamp'].iloc[0]} to {df['timestamp'].iloc[-1]}")
+        print(f"   💰 Current Price: {current_price}")
+        print(f"   📈 Data Points: {len(df)} bars")
             
         # 1. IDENTIFY CRT RANGE
         range_high, range_low, range_quality = detect_crt_range(df)
+        print(f"   📈 CRT Range - High: {range_high}, Low: {range_low}, Quality: {range_quality}")
         
         if range_quality <= 0.3:
-            print(f"   ❌ SKIP: Range quality too low ({range_quality:.2f} <= 0.3)")
+            print(f"   ❌ SKIP: Range quality too low ({range_quality} <= 0.3)")
             continue
             
-        print(f"   ✅ Range quality OK: {range_quality:.2f}")
+        print(f"   ✅ Range quality OK: {range_quality}")
 
         # 2. DETECT SWEEP
         sweep_direction = detect_crt_sweep(df, range_high, range_low)
@@ -685,7 +912,7 @@ def generate_signal(symbol):
                 }
                 best_confidence = final_confidence
                 best_tf = tf
-                print(f"   💾 NEW BEST SIGNAL: {direction} at {best_signal['entry']:.1f}")
+                print(f"   💾 NEW BEST SIGNAL: {direction} at {best_signal['entry']}")
 
     if best_signal and best_confidence >= 40:
         print(f"\n🎉 ✅ SIGNAL GENERATED: {symbol} {best_signal['direction']} | Confidence: {best_confidence:.1f}%")
@@ -719,13 +946,18 @@ def analyze_symbol(symbol):
         return False
 
     # Basic volume check only (no complex volume analysis)
-    vol24 = get_24h_quote_volume(symbol)
-    if vol24 < 1_500_000.0:
-        print(f"📉 LOW VOLUME: {symbol} - ${vol24:,.0f} (need $1.5M)")
+    try:
+        vol24 = get_24h_quote_volume(symbol)
+        if vol24 < 1_500_000.0:
+            print(f"📉 LOW VOLUME: {symbol} - ${vol24:,.0f} (need $1.5M)")
+            skipped_signals += 1
+            return False
+        else:
+            print(f"📈 VOLUME OK: {symbol} - ${vol24:,.0f}")
+    except Exception as e:
+        print(f"⚠️ Volume check error for {symbol}: {e}")
         skipped_signals += 1
         return False
-    else:
-        print(f"📈 VOLUME OK: {symbol} - ${vol24:,.0f}")
 
     # Cooldown check
     if last_trade_time.get(symbol, 0) > now:
@@ -745,7 +977,13 @@ def analyze_symbol(symbol):
 
     # 🔥 USE ONLY ROMEOPTP SIGNAL GENERATION - NO LEGACY SCORING
     print(f"🎯 ROMEOPTP SCANNING {symbol}...")
-    return generate_signal(symbol)
+    try:
+        return generate_signal(symbol)
+    except Exception as e:
+        print(f"❌ ERROR in generate_signal for {symbol}: {e}")
+        import traceback
+        print(f"🔧 Stack trace: {traceback.format_exc()}")
+        return False
 
 # ===== LOGGING FUNCTIONS =====
 def init_csv():
