@@ -536,6 +536,47 @@ def next_liquidity_target(df, current_price, direction):
         # Fallback: 2% below current
         return current_price * 0.98
 
+def btc_volatility_spike(window=20, threshold=2.0):
+    """
+    🔥 BTC VOLATILITY SPIKE DETECTION
+    Check if BTC has abnormal volatility that might affect all markets
+    Returns: True if volatility spike detected, False otherwise
+    """
+    try:
+        # Get BTC data
+        btc_df = get_klines("BTCUSDT", "5m", window * 2)
+        if btc_df is None or len(btc_df) < window:
+            return False
+        
+        # Calculate returns and volatility
+        prices = btc_df['close'].values
+        if len(prices) < window:
+            return False
+            
+        returns = []
+        for i in range(1, len(prices)):
+            ret = (prices[i] - prices[i-1]) / prices[i-1]
+            returns.append(abs(ret))  # Use absolute returns for volatility
+        
+        if len(returns) < window:
+            return False
+            
+        # Current volatility (last window)
+        current_vol = np.mean(returns[-window:])
+        # Historical volatility (previous window)
+        historical_vol = np.mean(returns[-window*2:-window]) if len(returns) >= window*2 else current_vol
+        
+        # Check for spike
+        if historical_vol > 0 and current_vol > historical_vol * threshold:
+            print(f"⚠️ BTC Volatility Spike: {current_vol:.4f} vs {historical_vol:.4f} (threshold: {threshold}x)")
+            return True
+        else:
+            return False
+            
+    except Exception as e:
+        print(f"❌ BTC volatility check error: {e}")
+        return False
+
 # ===== ROMEOPTP SIGNAL GENERATION WITH DETAILED LOGGING =====
 def generate_signal(symbol):
     """
