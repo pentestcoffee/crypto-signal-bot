@@ -50,6 +50,9 @@ class RomeoptpLiquidityEngine:
         self.LOOKBACK_SWINGS = 30  # For turtle soup detection
         self.MIN_COMPRESSION_BARS = 5  # Minimum bars for compression detection
         self.FVG_TOLERANCE = 0.002  # 0.2% for FVG detection
+        
+# ===== ROMEOPTP VOLUME THRESHOLD =====
+MIN_QUOTE_VOLUME = 1_500_000.0  # $1.5M minimum volume
 
 # ===== DISABLED FILTERS =====
 # ALL trend, sentiment, and momentum filters removed as per specification
@@ -800,8 +803,7 @@ def summary():
 # ===== ROMEOPTP SIGNAL GENERATION WITH DETAILED LOGGING =====
 def generate_signal(symbol):
     """
-    🔥 REWRITTEN SIGNAL GENERATION: Pure Romeoptp liquidity manipulation flow
-    WITH ENHANCED DEBUGGING
+    🔥 FIXED SIGNAL GENERATION: Adjusted thresholds to actually generate signals
     """
     global total_checked_signals, skipped_signals, signals_sent_total
     
@@ -830,12 +832,13 @@ def generate_signal(symbol):
         print(f"   💰 Current Price: {current_price}")
         print(f"   📈 Data Points: {len(df)} bars")
             
-        # 1. IDENTIFY CRT RANGE
+        # 1. IDENTIFY CRT RANGE - FIXED THRESHOLD
         range_high, range_low, range_quality = detect_crt_range(df)
         print(f"   📈 CRT Range - High: {range_high}, Low: {range_low}, Quality: {range_quality}")
         
-        if range_quality <= 0.3:
-            print(f"   ❌ SKIP: Range quality too low ({range_quality} <= 0.3)")
+        # 🔥 FIX 1: Reduced from 0.3 to 0.15
+        if range_quality <= 0.15:
+            print(f"   ❌ SKIP: Range quality too low ({range_quality} <= 0.15)")
             continue
             
         print(f"   ✅ Range quality OK: {range_quality}")
@@ -860,7 +863,7 @@ def generate_signal(symbol):
             
         print(f"   ✅ Reclaim confirmed")
 
-        # 4. CONFIRM BOS/MSS
+        # 4. CONFIRM BOS/MSS - MADE OPTIONAL
         mss_confirmation = detect_bos_mss(df, sweep_direction)
         print(f"   🏗️  BOS/MSS Confirmation: {mss_confirmation}")
         
@@ -868,31 +871,31 @@ def generate_signal(symbol):
         turtle_signal = detect_turtle_soup(df)
         print(f"   🐢 Turtle Soup: {turtle_signal}")
         
-        # ROMEOPTP SIGNAL LOGIC: turtle_soup OR (crt_sweep AND mss)
+        # 🔥 FIX 2: More flexible signal logic
         valid_signal = False
         direction = None
         
-        if turtle_signal == "bullish" or (sweep_direction == "swept_low" and mss_confirmation == "bullish_shift"):
+        # BULLISH: Low sweep OR bullish turtle (MSS optional)
+        if (sweep_direction == "swept_low") or (turtle_signal == "bullish"):
             direction = "BUY"
             valid_signal = True
-            print(f"   🟢 BULLISH SETUP: Turtle={turtle_signal}, Sweep={sweep_direction}, MSS={mss_confirmation}")
-        elif turtle_signal == "bearish" or (sweep_direction == "swept_high" and mss_confirmation == "bearish_shift"):
-            direction = "SELL"
+            print(f"   🟢 BULLISH SETUP: Turtle={turtle_signal}, Sweep={sweep_direction}")
+        # BEARISH: High sweep OR bearish turtle (MSS optional)  
+        elif (sweep_direction == "swept_high") or (turtle_signal == "bearish"):
+            direction = "SELL" 
             valid_signal = True
-            print(f"   🔴 BEARISH SETUP: Turtle={turtle_signal}, Sweep={sweep_direction}, MSS={mss_confirmation}")
+            print(f"   🔴 BEARISH SETUP: Turtle={turtle_signal}, Sweep={sweep_direction}")
         else:
             print(f"   ❌ SKIP: No valid signal combination")
-            print(f"      Turtle: {turtle_signal}, Sweep: {sweep_direction}, MSS: {mss_confirmation}")
+            print(f"      Turtle: {turtle_signal}, Sweep: {sweep_direction}")
         
         if valid_signal and direction:
-            # Calculate confidence based on multiple confirmations
-            confidence = range_quality * 0.4
+            # 🔥 FIX 3: More generous confidence calculation
+            confidence = range_quality * 0.6  # Increased from 0.4
             if mss_confirmation: 
-                confidence += 0.3
-                print(f"   📊 Confidence +0.3 for MSS")
+                confidence += 0.2  # Reduced from 0.3 (now optional bonus)
             if turtle_signal: 
-                confidence += 0.3
-                print(f"   📊 Confidence +0.3 for Turtle Soup")
+                confidence += 0.2  # Reduced from 0.3
             
             final_confidence = confidence * 100
             print(f"   🎯 FINAL CONFIDENCE: {final_confidence:.1f}%")
@@ -914,11 +917,12 @@ def generate_signal(symbol):
                 best_tf = tf
                 print(f"   💾 NEW BEST SIGNAL: {direction} at {best_signal['entry']}")
 
-    if best_signal and best_confidence >= 40:
+    # 🔥 FIX 4: Reduced confidence threshold from 40 to 35
+    if best_signal and best_confidence >= 35:
         print(f"\n🎉 ✅ SIGNAL GENERATED: {symbol} {best_signal['direction']} | Confidence: {best_confidence:.1f}%")
         return process_romeoptp_signal(best_signal)
     elif best_signal:
-        print(f"\n❌ SKIP: Confidence too low ({best_confidence:.1f}% < 40%)")
+        print(f"\n❌ SKIP: Confidence too low ({best_confidence:.1f}% < 35%)")
     else:
         print(f"\n❌ NO SIGNAL: No valid setups found across all timeframes")
     
