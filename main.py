@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SIRTS v10 – Top 80 | Bybit + symbol sanitization + Aggressive Mode defaults
-# ENHANCED WITH MOMENTUM INTEGRITY FRAMEWORK
+# ENHANCED WITH MOMENTUM INTEGRITY FRAMEWORK & AEGIS FILTERS
 # Requirements: requests, pandas, numpy
 # BOT_TOKEN and CHAT_ID must be set as environment variables: "BOT_TOKEN", "CHAT_ID"
 
@@ -47,12 +47,12 @@ WEIGHT_CRT    = 0.30    # More on reversals
 WEIGHT_VOLUME = 0.10    # Minimal volume reliance
 
 # ===== HIGH ACCURACY THRESHOLDS =====
-MIN_TF_SCORE  = 50      # More flexible per-TF scoring
-CONF_MIN_TFS  = 2       # Require 2/4 timeframes to agree
-CONFIDENCE_MIN = 55.0   # Good confidence threshold
+MIN_TF_SCORE  = 58      # Balanced: Strong but achievable signals
+CONF_MIN_TFS  = 2       # Practical: 50% timeframe agreement (but with Aegis filters)
+CONFIDENCE_MIN = 62.0   # Quality: Good confidence but not elite-only
 
-MIN_QUOTE_VOLUME = 1_000_000.0
-TOP_SYMBOLS = 80
+MIN_QUOTE_VOLUME = 2_000_000.0  # Healthy: $2M+ volume (reduces junk coins)
+TOP_SYMBOLS = 60        # Coverage: Enough symbols to find opportunities
 
 # ===== ADVANCED FILTERS CONFIG =====
 ENABLE_MARKET_REGIME_FILTER = False  # Disabled - too restrictive
@@ -913,7 +913,21 @@ def analyze_symbol(symbol):
         print(f"Skipping {symbol}: safety check failed (conf={confidence_pct:.1f}%, tfs={tf_confirmations}).")
         skipped_signals += 1
         return False
-# -------------------------------------------------------------------------
+
+    # ===== AEGIS FRAMEWORK FILTERS =====
+    # 1. SENTIMENT FILTER: REJECT ALL GREED SIGNALS
+    sentiment = sentiment_label()
+    if sentiment == "greed":
+        print(f"🚫 AEGIS FILTER: Skipping {symbol} - Greed sentiment detected")
+        skipped_signals += 1
+        return False
+    
+    # 2. TIMEFRAME FILTER: MUST HAVE 4H CONFIRMATION  
+    if "4h" not in confirming_tfs:
+        print(f"🚫 AEGIS FILTER: Skipping {symbol} - No 4h timeframe confirmation")
+        skipped_signals += 1
+        return False
+    # ===== END AEGIS FRAMEWORK FILTERS =====
 
     # ===== MOMENTUM INTEGRITY FRAMEWORK CHECKS =====
     # These can be disabled via config flags - completely optional
@@ -936,7 +950,6 @@ def analyze_symbol(symbol):
         return False
         
     # 4. Intelligent Sentiment Interpretation (Fixes "fear = short")
-    sentiment = sentiment_label()
     if ENABLE_INTELLIGENT_SENTIMENT:
         sentiment_analysis = intelligent_sentiment_check(sentiment, symbol, chosen_dir)
         if sentiment_analysis == "CAUTION":
@@ -970,15 +983,17 @@ def analyze_symbol(symbol):
         skipped_signals += 1
         return False
 
-    # dedupe on signature
+    # FIXED: Enhanced duplicate signal prevention with longer cooldown
     sig = (symbol, chosen_dir, round(chosen_entry, 6))
-    if recent_signals.get(sig, 0) + RECENT_SIGNAL_SIGNATURE_EXPIRE > time.time():
-        print(f"Skipping {symbol}: duplicate recent signal {sig}.")
-        skipped_signals += 1
-        return False
-    recent_signals[sig] = time.time()
-
-    sentiment = sentiment_label()
+    current_time = time.time()
+    if sig in recent_signals:
+        time_since_last = current_time - recent_signals[sig]
+        if time_since_last < RECENT_SIGNAL_SIGNATURE_EXPIRE * 2:  # Double the cooldown
+            print(f"Skipping {symbol}: duplicate recent signal {sig} ({(RECENT_SIGNAL_SIGNATURE_EXPIRE * 2 - time_since_last):.0f}s remaining).")
+            skipped_signals += 1
+            return False
+    
+    recent_signals[sig] = current_time
 
     conf_multiplier = max(0.5, min(1.3, confidence_pct / 100.0 + 0.5))
     tp_sl = trade_params(symbol, entry, chosen_dir, conf_multiplier=conf_multiplier)
@@ -1045,6 +1060,9 @@ def analyze_symbol(symbol):
         risk_used*100, confidence_pct, "open", str(breakdown_per_tf)
     ])
     print(f"✅ HIGH QUALITY Signal sent for {symbol} at entry {entry}. Confidence {confidence_pct:.1f}%")
+    
+    # Apply immediate cooldown to prevent duplicate signals
+    last_trade_time[symbol] = time.time() + 300  # 5-minute cooldown per symbol
     return True
 
 # ===== TRADE CHECK (TP/SL/BREAKEVEN) =====
