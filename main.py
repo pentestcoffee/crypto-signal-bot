@@ -46,13 +46,12 @@ WEIGHT_TURTLE = 0.35    # More on breakouts (high probability)
 WEIGHT_CRT    = 0.30    # More on reversals  
 WEIGHT_VOLUME = 0.10    # Minimal volume reliance
 
-# ===== HIGH ACCURACY THRESHOLDS =====
-MIN_TF_SCORE  = 58      # Balanced: Strong but achievable signals
-CONF_MIN_TFS  = 2       # Practical: 50% timeframe agreement (but with Aegis filters)
-CONFIDENCE_MIN = 62.0   # Quality: Good confidence but not elite-only
-
-MIN_QUOTE_VOLUME = 2_000_000.0  # Healthy: $2M+ volume (reduces junk coins)
-TOP_SYMBOLS = 60        # Coverage: Enough symbols to find opportunities
+# ===== ACTIVE TRADER BALANCE =====
+MIN_TF_SCORE  = 55      # Slightly more permissive
+CONF_MIN_TFS  = 2       # Same
+CONFIDENCE_MIN = 58.0   # Reduced from 62.0
+MIN_QUOTE_VOLUME = 1_500_000.0  # More symbols qualify
+TOP_SYMBOLS = 70        # More opportunities
 
 # ===== ADVANCED FILTERS CONFIG =====
 ENABLE_MARKET_REGIME_FILTER = False  # Disabled - too restrictive
