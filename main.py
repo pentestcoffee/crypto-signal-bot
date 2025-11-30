@@ -837,8 +837,8 @@ def generate_signal(symbol):
         print(f"   📈 CRT Range - High: {range_high}, Low: {range_low}, Quality: {range_quality}")
         
         # 🔥 FIX 1: Reduced from 0.3 to 0.15
-        if range_quality <= 0.15:
-            print(f"   ❌ SKIP: Range quality too low ({range_quality} <= 0.15)")
+        if range_quality <= 0.08:
+            print(f"   ❌ SKIP: Range quality too low ({range_quality} <= 0.08)")
             continue
             
         print(f"   ✅ Range quality OK: {range_quality}")
@@ -891,11 +891,11 @@ def generate_signal(symbol):
         
         if valid_signal and direction:
             # 🔥 FIX 3: More generous confidence calculation
-            confidence = range_quality * 0.6  # Increased from 0.4
+            confidence = range_quality * 0.8  # Increased from 0.4
             if mss_confirmation: 
-                confidence += 0.2  # Reduced from 0.3 (now optional bonus)
+                confidence += 0.3  # Reduced from 0.3 (now optional bonus)
             if turtle_signal: 
-                confidence += 0.2  # Reduced from 0.3
+                confidence += 0.3  # Reduced from 0.3
             
             final_confidence = confidence * 100
             print(f"   🎯 FINAL CONFIDENCE: {final_confidence:.1f}%")
@@ -918,7 +918,7 @@ def generate_signal(symbol):
                 print(f"   💾 NEW BEST SIGNAL: {direction} at {best_signal['entry']}")
 
     # 🔥 FIX 4: Reduced confidence threshold from 40 to 35
-    if best_signal and best_confidence >= 35:
+    if best_signal and best_confidence >= 25:
         print(f"\n🎉 ✅ SIGNAL GENERATED: {symbol} {best_signal['direction']} | Confidence: {best_confidence:.1f}%")
         return process_romeoptp_signal(best_signal)
     elif best_signal:
