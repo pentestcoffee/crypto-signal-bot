@@ -1,1096 +1,498 @@
 #!/usr/bin/env python3
-# ROMEOPTP LIQUIDITY MANIPULATION ENGINE - Bybit Edition
-# TRANSFORMED FROM SIRTS v10 TO PURE PRICE-BASED MANIPULATION ANALYSIS
-# Requirements: requests, pandas, numpy
-# BOT_TOKEN and CHAT_ID must be set as environment variables: "BOT_TOKEN", "CHAT_ID"
+# -*- coding: utf-8 -*-
 
-import os
-import re
-import time
-import requests
+"""
+LIVE ROMEOPT 6-STEP SCANNER (Enhanced + Elite Features)
+- Fully live early signals
+- RomeOPT 6-step logic
+- TP/SL tracking with ATR or OB
+- Dynamic TP/SL updates (market-structure-based)
+- Telegram alerts
+- Async SQLite logging
+- Filters: Score >=5, Displacement +2, Sweep+2 OR Zone+1, avoid counter-trend
+- Improved Order Block detection
+- Adaptive Market Regime detection
+- HTF + Sweep scoring threshold
+- Elite multi-timeframe confirmation (15m,1h,4h)
+"""
+
+import os, time, asyncio, logging, datetime
+import aiosqlite
+import httpx
+import ccxt.async_support as ccxt
 import pandas as pd
-import numpy as np
-from datetime import datetime
-import csv
+from fastapi import FastAPI, Request, HTTPException
+import uvicorn
+from collections import defaultdict, deque
 
-# ===== SYMBOL SANITIZATION =====
-def sanitize_symbol(symbol: str) -> str:
-    """Ensure symbol only contains legal Bybit characters and is upper-case.
-       Allow letters, numbers, - _ . and max length 20."""
-    if not symbol or not isinstance(symbol, str):
-        return ""
-    s = re.sub(r"[^A-Z0-9_.-]", "", symbol.upper())
-    return s[:20]
+# ---------------- CONFIG ----------------
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "changeme")
+DB_PATH = "/app/data/signals.db"
 
-# ===== CONFIG =====
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHAT_ID   = os.getenv("CHAT_ID")
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 10))
+TOP_N = int(os.getenv("TOP_N", 60))
 
-CAPITAL = 80.0
-LEVERAGE = 30
-COOLDOWN_TIME_DEFAULT = 1800
-COOLDOWN_TIME_SUCCESS = 15 * 60
-COOLDOWN_TIME_FAIL    = 45 * 60
+# ==== CHANGE 1: BYBIT TIMEFRAMES ====
+TIMEFRAMES = ["30m", "1h", "2h", "3h", "4h"]  # Changed from ["1m","3m","5m","15m","30m"]
+MIN_SCORE = 5
+CRITICAL_FACTORS_MIN = 2  # HTF Alignment + Liquidity Sweep minimum
 
-VOLATILITY_THRESHOLD_PCT = 2.5
-VOLATILITY_PAUSE = 1800
-CHECK_INTERVAL = 60
+# ==== ADDED: BYBIT TP/SL CONFIG ====
+MIN_TP_DISTANCE_RATIO = 0.15  # Minimum TP1 distance as % of risk (15%)
+MIN_RR_RATIO = 1.2  # Minimum risk/reward ratio 1:1.2
 
-API_CALL_DELAY = 0.06  # slightly higher for Bybit
+# ---------------- LOGGING ----------------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
+log = logging.getLogger("romeopt_bot")
+db_lock = asyncio.Lock()
+db_conn = None
 
-TIMEFRAMES = ["15m", "30m", "1h", "4h"]
+# ---------------- TELEGRAM ----------------
+def escape_html(msg: str) -> str:
+    if not msg: return "-"
+    return str(msg).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
-# ===== ROMEOPTP CORE PARAMETERS =====
-class RomeoptpLiquidityEngine:
-    def __init__(self):
-        # Core Romeoptp Parameters
-        self.CRT_TOLERANCE = 0.0005  # 0.05% tolerance for equal highs/lows
-        self.SWEEP_CONFIRMATION_PCT = 0.001  # 0.1% break for sweep confirmation
-        self.RECLAIM_CONFIRMATION = 0.0003  # 0.03% reclaim threshold
-        self.LOOKBACK_SWINGS = 30  # For turtle soup detection
-        self.MIN_COMPRESSION_BARS = 5  # Minimum bars for compression detection
-        self.FVG_TOLERANCE = 0.002  # 0.2% for FVG detection
-        
-# ===== ROMEOPTP VOLUME THRESHOLD =====
-MIN_QUOTE_VOLUME = 1_500_000.0  # $1.5M minimum volume
-
-# ===== DISABLED FILTERS =====
-# ALL trend, sentiment, and momentum filters removed as per specification
-ENABLE_TREND_ALIGNMENT_FILTER = False
-ENABLE_MARKET_CONTEXT_FILTER = False
-ENABLE_INTELLIGENT_SENTIMENT = False
-ENABLE_SR_FILTER = False
-ENABLE_MOMENTUM_FILTER = False
-ENABLE_BTC_DOMINANCE_FILTER = False
-STRICT_TF_AGREE = False
-
-# ===== BYBIT PUBLIC ENDPOINTS =====
-BYBIT_KLINES = "https://api.bybit.com/v5/market/kline"
-BYBIT_TICKERS = "https://api.bybit.com/v5/market/tickers"
-BYBIT_PRICE = "https://api.bybit.com/v5/market/tickers"
-
-LOG_CSV = "./romeoptp_signals_bybit.csv"
-
-# ===== NEW SAFEGUARDS =====
-MAX_OPEN_TRADES = 200
-MAX_EXPOSURE_PCT = 0.20
-MIN_MARGIN_USD = 0.25
-MIN_SL_DISTANCE_PCT = 0.0015
-SYMBOL_BLACKLIST = set([])
-RECENT_SIGNAL_SIGNATURE_EXPIRE = 300
-recent_signals = {}
-
-# ===== RISK & CONFIDENCE =====
-BASE_RISK = 0.05   # AGGRESSIVE: 5% per trade default
-MAX_RISK  = 0.06
-MIN_RISK  = 0.01
-
-# ===== STATE =====
-last_trade_time      = {}
-open_trades          = []
-signals_sent_total   = 0
-signals_hit_total    = 0
-signals_fail_total   = 0
-signals_breakeven    = 0
-total_checked_signals= 0
-skipped_signals      = 0
-last_heartbeat       = time.time()
-last_summary         = time.time()
-volatility_pause_until= 0
-last_trade_result = {}
-
-STATS = {
-    "by_side": {"BUY": {"sent":0,"hit":0,"fail":0,"breakeven":0},
-                "SELL":{"sent":0,"hit":0,"fail":0,"breakeven":0}},
-    "by_tf": {tf: {"sent":0,"hit":0,"fail":0,"breakeven":0} for tf in TIMEFRAMES}
-}
-
-# ===== REMOVED FILTER FUNCTIONS =====
-# All trend_alignment_ok, market_context_ok, intelligent_sentiment_check functions removed
-# All EMA, trend, sentiment logic completely eliminated
-
-# ===== HELPERS =====
-def send_message(text):
-    if not BOT_TOKEN or not CHAT_ID:
-        print("Telegram not configured:", text)
-        return False
-    try:
-        requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                      data={"chat_id": CHAT_ID, "text": text}, timeout=10)
-        return True
-    except Exception as e:
-        print("Telegram send error:", e)
-        return False
-
-def safe_get_json(url, params=None, timeout=5, retries=1):
-    """Fetch JSON with light retry/backoff and logging."""
-    for attempt in range(retries + 1):
+async def tg(msg: str):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID: return
+    safe_msg = escape_html(msg)
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    async with httpx.AsyncClient() as client:
         try:
-            r = requests.get(url, params=params, timeout=timeout)
-            r.raise_for_status()
-            return r.json()
-        except requests.exceptions.RequestException as e:
-            print(f"⚠️ API request error ({e}) for {url} params={params} attempt={attempt+1}/{retries+1}")
-            if attempt < retries:
-                time.sleep(0.6 * (attempt + 1))
-                continue
-            return None
+            await client.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": safe_msg, "parse_mode":"HTML"})
         except Exception as e:
-            print(f"⚠️ Unexpected error fetching {url}: {e}")
-            return None
+            log.warning(f"Telegram send failed: {e}")
 
-# ===== BYBIT / SYMBOL FUNCTIONS =====
-def get_top_symbols(n=70):
-    """Get top n USDT pairs by quote volume using Bybit tickers."""
-    params = {"category": "linear"}
-    j = safe_get_json(BYBIT_TICKERS, params=params, timeout=5, retries=1)
-    if not j or "result" not in j or "list" not in j["result"]:
-        return ["BTCUSDT","ETHUSDT"]
-    rows = j["result"]["list"]
-    usdt = []
-    for d in rows:
-        s = d.get("symbol","")
-        if not s.upper().endswith("USDT"):
-            continue
-        try:
-            vol = float(d.get("volume24h", 0))
-            last = float(d.get("lastPrice", 0)) or 0
-            quote_vol = vol * (last or 1.0)
-            usdt.append((s.upper(), quote_vol))
-        except Exception:
-            continue
-    usdt.sort(key=lambda x: x[1], reverse=True)
-    syms = [sanitize_symbol(s[0]) for s in usdt[:n]]
-    if not syms:
-        return ["BTCUSDT","ETHUSDT"]
-    return syms
+# ---------------- DATABASE ----------------
+async def init_db():
+    global db_conn
+    db_conn = await aiosqlite.connect(DB_PATH)
+    await db_conn.execute("PRAGMA journal_mode=WAL;")
+    await db_conn.execute("PRAGMA synchronous=NORMAL;")
+    await db_conn.execute("""
+        CREATE TABLE IF NOT EXISTS signals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT,
+            side TEXT,
+            entry REAL,
+            sl REAL,
+            tp1 REAL,
+            tp2 REAL,
+            tp3 REAL,
+            timestamp TEXT,
+            status TEXT,
+            reason TEXT,
+            score INTEGER,
+            tp1_hit INTEGER DEFAULT 0,
+            tp2_hit INTEGER DEFAULT 0,
+            tp3_hit INTEGER DEFAULT 0,
+            latest_ob TEXT,
+            rr_ratio REAL  # Added for risk/reward tracking
+        );
+    """)
+    await db_conn.commit()
 
-def get_24h_quote_volume(symbol):
-    symbol = sanitize_symbol(symbol)
-    if not symbol:
-        return 0.0
-    params = {"category": "linear", "symbol": symbol}
-    j = safe_get_json(BYBIT_TICKERS, params=params, timeout=5, retries=1)
-    if not j or "result" not in j or "list" not in j["result"]:
-        return 0.0
-    for d in j["result"]["list"]:
-        if d.get("symbol","").upper() == symbol:
-            try:
-                vol = float(d.get("volume24h", 0))
-                last = float(d.get("lastPrice", 0)) or 0
-                return vol * (last or 1.0)
-            except:
-                return 0.0
-    return 0.0
-
-def interval_to_bybit(interval):
-    """Map "15m","30m","1h","4h" to Bybit kline interval values."""
-    m = {"1m":"1", "3m":"3","5m":"5","15m":"15","30m":"30","1h":"60","2h":"120","4h":"240","1d":"D"}
-    return m.get(interval, interval)
-
-def get_klines(symbol, interval="15m", limit=200):
-    """Fetch klines from Bybit public API and return pandas DF with open/high/low/close/volume."""
-    symbol = sanitize_symbol(symbol)
-    if not symbol:
-        return None
-    iv = interval_to_bybit(interval)
-    params = {
-        "category": "linear",
-        "symbol": symbol, 
-        "interval": iv, 
-        "limit": limit
-    }
-    j = safe_get_json(BYBIT_KLINES, params=params, timeout=6, retries=1)
-    if not j or "result" not in j or "list" not in j["result"]:
-        return None
-    data = j["result"]["list"]
-    if not isinstance(data, list):
-        return None
+# ---------------- OHLCV ----------------
+async def fetch_ohlcv(exchange, symbol: str, timeframe: str, limit=200):
     try:
-        df = pd.DataFrame(data, columns=["startTime", "open", "high", "low", "close", "volume", "turnover"])
-        df = df[["open","high","low","close","volume"]].astype(float)
-        return df
+        return await exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
     except Exception as e:
-        print(f"⚠️ get_klines parse error for {symbol} {interval}: {e}")
+        log.debug("fetch_ohlcv failed for %s %s: %s", symbol, timeframe, e)
         return None
 
-def get_price(symbol):
-    symbol = sanitize_symbol(symbol)
-    if not symbol:
-        return None
-    params = {"category": "linear", "symbol": symbol}
-    j = safe_get_json(BYBIT_PRICE, params=params, timeout=5, retries=1)
-    if not j or "result" not in j or "list" not in j["result"]:
-        return None
-    for d in j["result"]["list"]:
-        if d.get("symbol","").upper() == symbol:
-            try:
-                return float(d.get("lastPrice", 0))
-            except:
-                return None
-    return None
+# ---------------- INDICATORS ----------------
+def atr(df: pd.DataFrame, period=14):
+    high, low, close = df["high"], df["low"], df["close"]
+    tr = pd.DataFrame({
+        "h-l": high - low,
+        "h-pc": (high - close.shift(1)).abs(),
+        "l-pc": (low - close.shift(1)).abs()
+    }).max(axis=1)
+    return tr.rolling(period, min_periods=1).mean()
 
-# ===== ROMEOPTP CORE LOGIC MODULES =====
-
-def detect_crt_range(df, lookback=50):
-    """
-    🔥 CRT ENGINE: Identify engineered equal highs and equal lows
-    Returns: range_high, range_low, quality_score
-    """
-    engine = RomeoptpLiquidityEngine()
-    
-    if len(df) < lookback:
-        return None, None, 0
-        
-    high = df['high'].tail(lookback)
-    low = df['low'].tail(lookback)
-    
-    # Find equal highs within tolerance
-    high_max = high.max()
-    high_min = high_max * (1 - engine.CRT_TOLERANCE)
-    equal_highs = high[high >= high_min]
-    
-    # Find equal lows within tolerance  
-    low_min = low.min()
-    low_max = low_min * (1 + engine.CRT_TOLERANCE)
-    equal_lows = low[low <= low_max]
-    
-    # Quality score based on number of touches
-    high_touches = len(equal_highs)
-    low_touches = len(equal_lows)
-    quality_score = min((high_touches + low_touches) / (lookback * 0.1), 1.0)
-    
-    print(f"      🔍 CRT Analysis: {high_touches} high touches, {low_touches} low touches")
-    
-    if high_touches >= 2 and low_touches >= 2:
-        return high_max, low_min, quality_score
+# ---------------- MARKET REGIME ----------------
+async def detect_market_regime(df: pd.DataFrame):
+    ma_htf = df["close"].rolling(50).mean().iloc[-1]
+    price = df["close"].iloc[-1]
+    recent_high = df["high"].iloc[-20:].max()
+    recent_low = df["low"].iloc[-20:].min()
+    range_pct = (recent_high - recent_low) / max(1e-8, recent_low)
+    if price > ma_htf and range_pct > 0.02:
+        return "BULL"
+    elif price < ma_htf and range_pct > 0.02:
+        return "BEAR"
     else:
-        return None, None, 0
+        return "RANGE"
 
-def detect_crt_sweep(df, range_high, range_low):
-    """
-    🔥 CRT SWEEP DETECTION: Wick must break range, body must close back inside
-    Returns: "swept_high", "swept_low", or None
-    """
-    engine = RomeoptpLiquidityEngine()
-    
-    if len(df) < 3 or range_high is None or range_low is None:
-        return None
-        
-    current = df.iloc[-1]
-    prev = df.iloc[-2]
-    
-    current_high = current['high']
-    current_low = current['low']
-    current_close = current['close']
-    current_open = current['open']
-    
-    prev_high = prev['high']
-    prev_low = prev['low']
-    
-    # Check for high sweep
-    high_break = current_high > range_high * (1 + engine.SWEEP_CONFIRMATION_PCT)
-    high_reclaim = current_close < range_high and current_open < range_high
-    
-    # Check for low sweep  
-    low_break = current_low < range_low * (1 - engine.SWEEP_CONFIRMATION_PCT)
-    low_reclaim = current_close > range_low and current_open > range_low
-    
-    if high_break and high_reclaim:
-        return "swept_high"
-    elif low_break and low_reclaim:
-        return "swept_low"
-    
-    return None
-
-def detect_compression(df, period=20):
-    """
-    🔥 COMPRESSION DETECTION: Pre-manipulation tightening
-    Higher lows + lower highs pattern
-    """
-    if len(df) < period:
-        return False, 0.0
-    
-    # Calculate ATR for volatility measurement
-    high = df['high'].values
-    low = df['low'].values
-    close = df['close'].values
-    
-    tr = []
-    for i in range(1, len(df)):
-        tr1 = high[i] - low[i]
-        tr2 = abs(high[i] - close[i-1])
-        tr3 = abs(low[i] - close[i-1])
-        tr.append(max(tr1, tr2, tr3))
-    
-    if not tr:
-        return False, 0.0
-        
-    current_atr = np.mean(tr[-5:]) if len(tr) >= 5 else tr[-1]
-    historical_atr = np.mean(tr) if tr else current_atr
-    
-    # Compression: current volatility significantly lower than historical
-    compression_ratio = current_atr / historical_atr if historical_atr > 0 else 1.0
-    is_compressed = compression_ratio < 0.6  # 40%+ reduction in volatility
-    
-    return is_compressed, compression_ratio
-
-def detect_crt_reclaim(df, range_high, range_low, sweep_direction):
-    """
-    🔥 CRT RECLAIM: After sweep → candle closes inside → reclaim confirmed
-    """
-    engine = RomeoptpLiquidityEngine()
-    
-    if len(df) < 2 or range_high is None or range_low is None:
-        return False
-        
-    current = df.iloc[-1]
-    current_close = current['close']
-    
-    if sweep_direction == "swept_high":
-        # For high sweep reclaim, price should close back below range high
-        reclaim = current_close < range_high * (1 - engine.RECLAIM_CONFIRMATION)
-        return reclaim
-    elif sweep_direction == "swept_low":
-        # For low sweep reclaim, price should close back above range low  
-        reclaim = current_close > range_low * (1 + engine.RECLAIM_CONFIRMATION)
-        return reclaim
-    
-    return False
-
-def detect_turtle_soup(df, lookback=30):
-    """
-    🔥 TURTLE SOUP ENGINE: Identify previous swing high/low breaks with reclaim
-    Returns: "bullish", "bearish", or None
-    """
-    if len(df) < lookback + 5:
-        return None
-        
-    # Find previous swing high and low
-    highs = df['high'].tail(lookback)
-    lows = df['low'].tail(lookback)
-    
-    swing_high = highs.max()
-    swing_low = lows.min()
-    
-    current = df.iloc[-1]
-    prev = df.iloc[-2]
-    
-    current_high = current['high']
-    current_low = current['low'] 
-    current_close = current['close']
-    
-    prev_high = prev['high']
-    prev_low = prev['low']
-    
-    # Bullish Turtle Soup: Break below swing low then reclaim
-    low_break = current_low < swing_low * 0.998
-    low_reclaim = current_close > swing_low * 1.002
-    
-    # Bearish Turtle Soup: Break above swing high then reclaim  
-    high_break = current_high > swing_high * 1.002
-    high_reclaim = current_close < swing_high * 0.998
-    
-    if low_break and low_reclaim:
-        return "bullish"
-    elif high_break and high_reclaim:
-        return "bearish"
-    
-    return None
-
-def detect_bos_mss(df, sweep_direction):
-    """
-    🔥 MARKET STRUCTURE ENGINE: Break of Structure / Market Structure Shift
-    After sweep → displacement candle opposite direction
-    Returns: 'bullish_shift', 'bearish_shift', or None
-    """
-    if len(df) < 5:
-        return None
-        
-    current = df.iloc[-1]
-    prev_1 = df.iloc[-2]
-    prev_2 = df.iloc[-3]
-    
-    if sweep_direction == "swept_high":
-        # For high sweep, look for bearish MSS (lower highs)
-        lower_high = current['high'] < prev_1['high'] and prev_1['high'] < prev_2['high']
-        lower_low = current['low'] < prev_1['low'] 
-        if lower_high and lower_low:
-            return 'bearish_shift'
-            
-    elif sweep_direction == "swept_low":
-        # For low sweep, look for bullish MSS (higher lows)
-        higher_low = current['low'] > prev_1['low'] and prev_1['low'] > prev_2['low']
-        higher_high = current['high'] > prev_1['high']
-        if higher_low and higher_high:
-            return 'bullish_shift'
-    
-    return None
-
-def detect_order_block(df, direction):
-    """
-    🔥 ORDER BLOCK ENGINE: 
-    For longs: last down candle before up displacement
-    For shorts: last up candle before down displacement
-    Returns: OB zone (high, low)
-    """
-    if len(df) < 10:
-        return None, None
-        
-    if direction == "BUY":
-        # Look for the last bearish candle before a bullish move
-        for i in range(-5, -len(df), -1):
-            current = df.iloc[i]
-            next_candle = df.iloc[i+1] if i < -1 else None
-            
-            if next_candle is None:
-                continue
-                
-            # Bearish candle (close < open) followed by bullish candle
-            is_bearish = current['close'] < current['open']
-            next_bullish = next_candle['close'] > next_candle['open']
-            
-            if is_bearish and next_bullish:
-                return current['high'], current['low']
-                
-    elif direction == "SELL":
-        # Look for the last bullish candle before a bearish move
-        for i in range(-5, -len(df), -1):
-            current = df.iloc[i]
-            next_candle = df.iloc[i+1] if i < -1 else None
-            
-            if next_candle is None:
-                continue
-                
-            # Bullish candle (close > open) followed by bearish candle
-            is_bullish = current['close'] > current['open']
-            next_bearish = next_candle['close'] < next_candle['open']
-            
-            if is_bullish and next_bearish:
-                return current['high'], current['low']
-    
-    return None, None
-
-def detect_fvg(df):
-    """
-    🔥 FAIR VALUE GAP ENGINE: 3-candle imbalance detection
-    Returns: bullish_fvgs[], bearish_fvgs[]
-    """
-    engine = RomeoptpLiquidityEngine()
-    
-    if len(df) < 3:
-        return [], []
-        
-    bullish_fvgs = []
-    bearish_fvgs = []
-    
-    for i in range(len(df) - 2):
-        candle1 = df.iloc[i]
-        candle2 = df.iloc[i+1] 
-        candle3 = df.iloc[i+2]
-        
-        # Bullish FVG: candle1 low > candle3 high
-        if candle1['low'] > candle3['high']:
-            gap_high = candle1['low']
-            gap_low = candle3['high']
-            if (gap_high - gap_low) / gap_low > engine.FVG_TOLERANCE:
-                bullish_fvgs.append((gap_low, gap_high))
-        
-        # Bearish FVG: candle1 high < candle3 low  
-        elif candle1['high'] < candle3['low']:
-            gap_low = candle1['high']
-            gap_high = candle3['low']
-            if (gap_high - gap_low) / gap_low > engine.FVG_TOLERANCE:
-                bearish_fvgs.append((gap_low, gap_high))
-    
-    return bullish_fvgs, bearish_fvgs
-
-def next_liquidity_target(df, current_price, direction):
-    """
-    🔥 NEXT LIQUIDITY TARGET ENGINE: Find next equal highs/lows or nearby FVG
-    Returns: target_price
-    """
-    if len(df) < 50:
-        return current_price * 1.02 if direction == "BUY" else current_price * 0.98
-    
-    lookback = min(100, len(df))
-    
-    if direction == "BUY":
-        # For longs, look for next equal highs (liquidity above)
-        highs = df['high'].tail(lookback)
-        # Find significant highs (top 20%)
-        significant_highs = highs.nlargest(int(lookback * 0.2))
-        if len(significant_highs) > 0:
-            target = significant_highs.max()
-            # Ensure target is above current price
-            if target > current_price:
-                return target
-        # Fallback: 2% above current
-        return current_price * 1.02
-        
-    else:  # SELL
-        # For shorts, look for next equal lows (liquidity below)
-        lows = df['low'].tail(lookback)
-        # Find significant lows (bottom 20%)
-        significant_lows = lows.nsmallest(int(lookback * 0.2))
-        if len(significant_lows) > 0:
-            target = significant_lows.min()
-            # Ensure target is below current price
-            if target < current_price:
-                return target
-        # Fallback: 2% below current
-        return current_price * 0.98
-
-def btc_volatility_spike(window=20, threshold=2.0):
-    """
-    🔥 BTC VOLATILITY SPIKE DETECTION
-    Check if BTC has abnormal volatility that might affect all markets
-    Returns: True if volatility spike detected, False otherwise
-    """
-    try:
-        # Get BTC data
-        btc_df = get_klines("BTCUSDT", "5m", window * 2)
-        if btc_df is None or len(btc_df) < window:
+# ---------------- MULTI-TIMEFRAME ELITE CONFIRM ----------------
+async def elite_tf_alignment(exchange, symbol: str, side: str):
+    # ==== CHANGE 2: UPDATED TIMEFRAMES FOR BYBIT ====
+    tfs = ["30m", "1h", "2h"]  # Changed from ["15m","1h","4h"] to match Bybit focus
+    for tf in tfs:
+        ohlcv = await fetch_ohlcv(exchange, symbol, tf, 50)
+        if not ohlcv: return False
+        df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","vol"])
+        trend = df["close"].iloc[-1] - df["close"].iloc[-5]
+        trend_side = "BUY" if trend>0 else "SELL"
+        if trend_side != side:
             return False
-        
-        # Calculate returns and volatility
-        prices = btc_df['close'].values
-        if len(prices) < window:
-            return False
-            
-        returns = []
-        for i in range(1, len(prices)):
-            ret = (prices[i] - prices[i-1]) / prices[i-1]
-            returns.append(abs(ret))  # Use absolute returns for volatility
-        
-        if len(returns) < window:
-            return False
-            
-        # Current volatility (last window)
-        current_vol = np.mean(returns[-window:])
-        # Historical volatility (previous window)
-        historical_vol = np.mean(returns[-window*2:-window]) if len(returns) >= window*2 else current_vol
-        
-        # Check for spike
-        if historical_vol > 0 and current_vol > historical_vol * threshold:
-            print(f"⚠️ BTC Volatility Spike: {current_vol:.4f} vs {historical_vol:.4f} (threshold: {threshold}x)")
-            return True
-        else:
-            return False
-            
-    except Exception as e:
-        print(f"❌ BTC volatility check error: {e}")
-        return False
-
-# ===== MISSING FUNCTIONS ADDED =====
-def process_romeoptp_signal(signal):
-    """
-    🔥 PROCESS ROMEOPTP SIGNAL: Execute trade based on Romeoptp signal
-    """
-    global signals_sent_total, open_trades, last_trade_time
-    
-    symbol = signal['symbol']
-    direction = signal['direction']
-    entry_price = signal['entry']
-    confidence = signal['confidence']
-    
-    print(f"🎯 PROCESSING ROMEOPTP SIGNAL: {symbol} {direction} at {entry_price}")
-    
-    # Calculate position sizing
-    risk_pct = min(max(BASE_RISK * (confidence / 100), MIN_RISK), MAX_RISK)
-    margin_usd = CAPITAL * risk_pct
-    exposure_usd = margin_usd * LEVERAGE
-    
-    # Calculate TP/SL levels
-    if direction == "BUY":
-        sl_price = entry_price * (1 - 0.01)  # 1% SL
-        tp1 = entry_price * (1 + 0.005)      # 0.5% TP1
-        tp2 = entry_price * (1 + 0.01)       # 1% TP2  
-        tp3 = entry_price * (1 + 0.015)      # 1.5% TP3
-    else:  # SELL
-        sl_price = entry_price * (1 + 0.01)  # 1% SL
-        tp1 = entry_price * (1 - 0.005)      # 0.5% TP1
-        tp2 = entry_price * (1 - 0.01)       # 1% TP2
-        tp3 = entry_price * (1 - 0.015)      # 1.5% TP3
-    
-    # Create trade object
-    trade = {
-        "s": symbol,
-        "side": direction,
-        "entry": entry_price,
-        "sl": sl_price,
-        "tp1": tp1,
-        "tp2": tp2, 
-        "tp3": tp3,
-        "entry_tf": signal['timeframe'],
-        "margin": margin_usd,
-        "exposure": exposure_usd,
-        "risk_pct": risk_pct,
-        "confidence_pct": confidence,
-        "st": "open",
-        "opened_at": time.time()
-    }
-    
-    # Add to open trades
-    open_trades.append(trade)
-    
-    # Update cooldown
-    last_trade_time[symbol] = time.time() + COOLDOWN_TIME_SUCCESS
-    
-    # Update stats
-    signals_sent_total += 1
-    STATS["by_side"][direction]["sent"] += 1
-    STATS["by_tf"][signal['timeframe']]["sent"] += 1
-    
-    # Send Telegram alert
-    message = (
-        f"🎯 ROMEOPTP SIGNAL\n"
-        f"Symbol: {symbol} {direction}\n"
-        f"Entry: {entry_price:.4f}\n" 
-        f"TP: {tp1:.4f} / {tp2:.4f} / {tp3:.4f}\n"
-        f"SL: {sl_price:.4f}\n"
-        f"Risk: {risk_pct*100:.1f}% | Confidence: {confidence:.1f}%\n"
-        f"TF: {signal['timeframe']} | Margin: ${margin_usd:.2f}"
-    )
-    send_message(message)
-    
-    # Log to CSV
-    log_signal([
-        datetime.utcnow().isoformat(), symbol, direction, entry_price, 
-        tp1, tp2, tp3, sl_price, signal['timeframe'], 
-        "N/A", margin_usd, exposure_usd, risk_pct*100, confidence, "open", "Romeoptp"
-    ])
-    
     return True
 
-def check_trades():
-    """
-    🔥 CHECK OPEN TRADES FOR TP/SL
-    """
-    global open_trades, signals_hit_total, signals_fail_total, signals_breakeven
-    
-    current_time = time.time()
-    still_open = []
-    
-    for trade in open_trades:
-        symbol = trade["s"]
-        current_price = get_price(symbol)
-        
-        if current_price is None:
-            still_open.append(trade)
-            continue
-            
-        direction = trade["side"]
-        entry = trade["entry"]
-        sl = trade["sl"]
-        tp1, tp2, tp3 = trade["tp1"], trade["tp2"], trade["tp3"]
-        
-        # Check for TP/SL
-        if direction == "BUY":
-            if current_price <= sl:
-                # Stop loss hit
-                trade["st"] = "closed"
-                trade["close_reason"] = "SL"
-                trade["closed_at"] = current_time
-                signals_fail_total += 1
-                STATS["by_side"][direction]["fail"] += 1
-                STATS["by_tf"][trade["entry_tf"]]["fail"] += 1
-                send_message(f"❌ SL HIT: {symbol} BUY | Entry: {entry:.4f} | Current: {current_price:.4f}")
-            elif current_price >= tp3:
-                # All TPs hit
-                trade["st"] = "closed" 
-                trade["close_reason"] = "TP3"
-                trade["closed_at"] = current_time
-                signals_hit_total += 1
-                STATS["by_side"][direction]["hit"] += 1
-                STATS["by_tf"][trade["entry_tf"]]["hit"] += 1
-                send_message(f"🎉 TP3 HIT: {symbol} BUY | Entry: {entry:.4f} | Current: {current_price:.4f}")
-            elif current_price >= tp2:
-                # TP2 hit
-                trade["st"] = "closed"
-                trade["close_reason"] = "TP2"
-                trade["closed_at"] = current_time
-                signals_hit_total += 1
-                STATS["by_side"][direction]["hit"] += 1
-                STATS["by_tf"][trade["entry_tf"]]["hit"] += 1
-                send_message(f"✅ TP2 HIT: {symbol} BUY | Entry: {entry:.4f} | Current: {current_price:.4f}")
-            elif current_price >= tp1:
-                # TP1 hit
-                trade["st"] = "closed"
-                trade["close_reason"] = "TP1"
-                trade["closed_at"] = current_time
-                signals_hit_total += 1
-                STATS["by_side"][direction]["hit"] += 1
-                STATS["by_tf"][trade["entry_tf"]]["hit"] += 1
-                send_message(f"✅ TP1 HIT: {symbol} BUY | Entry: {entry:.4f} | Current: {current_price:.4f}")
-            else:
-                still_open.append(trade)
-                
-        else:  # SELL
-            if current_price >= sl:
-                # Stop loss hit
-                trade["st"] = "closed"
-                trade["close_reason"] = "SL"
-                trade["closed_at"] = current_time
-                signals_fail_total += 1
-                STATS["by_side"][direction]["fail"] += 1
-                STATS["by_tf"][trade["entry_tf"]]["fail"] += 1
-                send_message(f"❌ SL HIT: {symbol} SELL | Entry: {entry:.4f} | Current: {current_price:.4f}")
-            elif current_price <= tp3:
-                # All TPs hit
-                trade["st"] = "closed"
-                trade["close_reason"] = "TP3"
-                trade["closed_at"] = current_time
-                signals_hit_total += 1
-                STATS["by_side"][direction]["hit"] += 1
-                STATS["by_tf"][trade["entry_tf"]]["hit"] += 1
-                send_message(f"🎉 TP3 HIT: {symbol} SELL | Entry: {entry:.4f} | Current: {current_price:.4f}")
-            elif current_price <= tp2:
-                # TP2 hit
-                trade["st"] = "closed"
-                trade["close_reason"] = "TP2"
-                trade["closed_at"] = current_time
-                signals_hit_total += 1
-                STATS["by_side"][direction]["hit"] += 1
-                STATS["by_tf"][trade["entry_tf"]]["hit"] += 1
-                send_message(f"✅ TP2 HIT: {symbol} SELL | Entry: {entry:.4f} | Current: {current_price:.4f}")
-            elif current_price <= tp1:
-                # TP1 hit
-                trade["st"] = "closed"
-                trade["close_reason"] = "TP1"
-                trade["closed_at"] = current_time
-                signals_hit_total += 1
-                STATS["by_side"][direction]["hit"] += 1
-                STATS["by_tf"][trade["entry_tf"]]["hit"] += 1
-                send_message(f"✅ TP1 HIT: {symbol} SELL | Entry: {entry:.4f} | Current: {current_price:.4f}")
-            else:
-                still_open.append(trade)
-    
-    # Log closed trades
-    for trade in open_trades:
-        if trade.get("st") == "closed" and not trade.get("logged"):
-            log_trade_close(trade)
-            trade["logged"] = True
-    
-    # Update open trades list
-    open_trades = [t for t in still_open if t.get("st") == "open"]
+# ---------------- ROMEOPT 6-STEP SIGNAL ----------------
+async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: str):
+    if df is None or len(df) < 20: return None
+    last = df.iloc[-1]
+    prev5 = df.iloc[-6:-1]
+    score = 0
+    reasons = []
 
-def heartbeat():
-    """Send periodic heartbeat"""
-    open_count = len([t for t in open_trades if t.get("st") == "open"])
-    message = (
-        f"❤️ ROMEOPTP HEARTBEAT\n"
-        f"Cycles: {cycle_count}\n"
-        f"Open Trades: {open_count}\n"
-        f"Signals: {signals_sent_total} sent, {signals_hit_total} hits\n"
-        f"Active: {len(SYMBOLS)} symbols"
-    )
-    send_message(message)
+    # Step 1: Liquidity Sweep
+    sweep_high = last["high"] > prev5["high"].max()
+    sweep_low = last["low"] < prev5["low"].min()
+    has_sweep = sweep_high or sweep_low
+    liquidity_sweep = 2 if has_sweep else 0
+    score += liquidity_sweep
+    reasons.append(f"Liquidity Sweep +{liquidity_sweep}")
 
-def summary():
-    """Send daily summary"""
-    hit_rate = (signals_hit_total / signals_sent_total * 100) if signals_sent_total > 0 else 0
-    message = (
-        f"📊 ROMEOPTP DAILY SUMMARY\n"
-        f"Signals: {signals_sent_total} sent\n"
-        f"Hits: {signals_hit_total} | Fails: {signals_fail_total}\n"
-        f"Hit Rate: {hit_rate:.1f}%\n"
-        f"Total Scans: {total_checked_signals}\n"
-        f"Skipped: {skipped_signals}"
-    )
-    send_message(message)
-
-# ===== ROMEOPTP SIGNAL GENERATION WITH DETAILED LOGGING =====
-def generate_signal(symbol):
-    """
-    🔥 FIXED SIGNAL GENERATION: Adjusted thresholds to actually generate signals
-    """
-    global total_checked_signals, skipped_signals, signals_sent_total
-    
-    total_checked_signals += 1
-    print(f"\n🎯 === SCANNING {symbol} ===")
-    
-    # Get data for multiple timeframes
-    best_signal = None
-    best_confidence = 0
-    best_tf = None
-    
-    for tf in TIMEFRAMES:
-        print(f"\n📊 Timeframe: {tf}")
-        df = get_klines(symbol, tf, 100)
-        if df is None or len(df) < 50:
-            print(f"   ❌ SKIP: No data or insufficient bars")
-            continue
-        
-        # Check dataframe structure
-        required_columns = ['open', 'high', 'low', 'close']
-        if not all(col in df.columns for col in required_columns):
-            print(f"   ❌ SKIP: Missing required columns. Available: {list(df.columns)}")
-            continue
-            
-        current_price = df['close'].iloc[-1]
-        print(f"   💰 Current Price: {current_price}")
-        print(f"   📈 Data Points: {len(df)} bars")
-            
-        # 1. IDENTIFY CRT RANGE - FIXED THRESHOLD
-        range_high, range_low, range_quality = detect_crt_range(df)
-        print(f"   📈 CRT Range - High: {range_high}, Low: {range_low}, Quality: {range_quality}")
-        
-        # 🔥 FIX 1: Reduced from 0.3 to 0.15
-        if range_quality <= 0.08:
-            print(f"   ❌ SKIP: Range quality too low ({range_quality} <= 0.08)")
-            continue
-            
-        print(f"   ✅ Range quality OK: {range_quality}")
-
-        # 2. DETECT SWEEP
-        sweep_direction = detect_crt_sweep(df, range_high, range_low)
-        print(f"   🔄 Sweep Detection: {sweep_direction}")
-        
-        if not sweep_direction:
-            print(f"   ❌ SKIP: No sweep detected")
-            continue
-            
-        print(f"   ✅ Sweep detected: {sweep_direction}")
-
-        # 3. CONFIRM RECLAIM
-        reclaim_confirmed = detect_crt_reclaim(df, range_high, range_low, sweep_direction)
-        print(f"   🔁 Reclaim Confirmation: {reclaim_confirmed}")
-        
-        if not reclaim_confirmed:
-            print(f"   ❌ SKIP: No reclaim confirmed")
-            continue
-            
-        print(f"   ✅ Reclaim confirmed")
-
-        # 4. CONFIRM BOS/MSS - MADE OPTIONAL
-        mss_confirmation = detect_bos_mss(df, sweep_direction)
-        print(f"   🏗️  BOS/MSS Confirmation: {mss_confirmation}")
-        
-        # 5. CHECK TURTLE SOUP (alternative signal)
-        turtle_signal = detect_turtle_soup(df)
-        print(f"   🐢 Turtle Soup: {turtle_signal}")
-        
-        # 🔥 FIX 2: More flexible signal logic
-        valid_signal = False
-        direction = None
-        
-        # BULLISH: Low sweep OR bullish turtle (MSS optional)
-        if (sweep_direction == "swept_low") or (turtle_signal == "bullish"):
-            direction = "BUY"
-            valid_signal = True
-            print(f"   🟢 BULLISH SETUP: Turtle={turtle_signal}, Sweep={sweep_direction}")
-        # BEARISH: High sweep OR bearish turtle (MSS optional)  
-        elif (sweep_direction == "swept_high") or (turtle_signal == "bearish"):
-            direction = "SELL" 
-            valid_signal = True
-            print(f"   🔴 BEARISH SETUP: Turtle={turtle_signal}, Sweep={sweep_direction}")
-        else:
-            print(f"   ❌ SKIP: No valid signal combination")
-            print(f"      Turtle: {turtle_signal}, Sweep: {sweep_direction}")
-        
-        if valid_signal and direction:
-            # 🔥 FIX 3: More generous confidence calculation
-            confidence = range_quality * 0.8  # Increased from 0.4
-            if mss_confirmation: 
-                confidence += 0.3  # Reduced from 0.3 (now optional bonus)
-            if turtle_signal: 
-                confidence += 0.3  # Reduced from 0.3
-            
-            final_confidence = confidence * 100
-            print(f"   🎯 FINAL CONFIDENCE: {final_confidence:.1f}%")
-            
-            if final_confidence > best_confidence:
-                best_signal = {
-                    'symbol': symbol,
-                    'direction': direction,
-                    'timeframe': tf,
-                    'entry': float(df['close'].iloc[-1]),
-                    'range_high': range_high,
-                    'range_low': range_low,
-                    'sweep_direction': sweep_direction,
-                    'mss_confirmation': mss_confirmation,
-                    'turtle_signal': turtle_signal,
-                    'confidence': final_confidence
-                }
-                best_confidence = final_confidence
-                best_tf = tf
-                print(f"   💾 NEW BEST SIGNAL: {direction} at {best_signal['entry']}")
-
-    # 🔥 FIX 4: Reduced confidence threshold from 40 to 35
-    if best_signal and best_confidence >= 25:
-        print(f"\n🎉 ✅ SIGNAL GENERATED: {symbol} {best_signal['direction']} | Confidence: {best_confidence:.1f}%")
-        return process_romeoptp_signal(best_signal)
-    elif best_signal:
-        print(f"\n❌ SKIP: Confidence too low ({best_confidence:.1f}% < 35%)")
+    # Step 2: Displacement
+    displacement = abs(last["close"] - last["open"]) / (last["high"] - last["low"] + 1e-8)
+    has_disp = displacement > 0.6
+    if has_disp:
+        score += 2; reasons.append("Displacement +2")
     else:
-        print(f"\n❌ NO SIGNAL: No valid setups found across all timeframes")
-    
-    return False
+        reasons.append("Displacement +0")
 
-# ===== ENHANCED ANALYZE_SYMBOL WITH LOGGING =====
-def analyze_symbol(symbol):
-    """
-    🔥 PURE ROMEOPTP ANALYSIS: Only uses Romeoptp liquidity manipulation detection
-    WITH DETAILED LOGGING
-    """
-    global total_checked_signals, skipped_signals, last_trade_time, volatility_pause_until
-    
-    total_checked_signals += 1
-    now = time.time()
-    
-    if time.time() < volatility_pause_until:
-        print(f"⏸️  VOLATILITY PAUSE: Skipping {symbol}")
-        skipped_signals += 1
-        return False
+    # Step 3 & 4: Order Block & Zone
+    ob_zone = None
+    for i in range(len(df)-5, len(df)-1):
+        candle, prev_candle = df.iloc[i], df.iloc[i-1]
+        if candle["close"]>candle["open"] and prev_candle["close"]<prev_candle["open"]:
+            ob_zone={"type":"bullish","low":min(candle["low"], prev_candle["low"]),"high":candle["close"]}; break
+        elif candle["close"]<candle["open"] and prev_candle["close"]>prev_candle["open"]:
+            ob_zone={"type":"bearish","low":candle["close"],"high":max(candle["high"], prev_candle["high"])}; break
 
-    if not symbol or symbol in SYMBOL_BLACKLIST:
-        print(f"🚫 BLACKLIST: Skipping {symbol}")
-        skipped_signals += 1
-        return False
-
-    # Basic volume check only (no complex volume analysis)
-    try:
-        vol24 = get_24h_quote_volume(symbol)
-        if vol24 < 1_500_000.0:
-            print(f"📉 LOW VOLUME: {symbol} - ${vol24:,.0f} (need $1.5M)")
-            skipped_signals += 1
-            return False
-        else:
-            print(f"📈 VOLUME OK: {symbol} - ${vol24:,.0f}")
-    except Exception as e:
-        print(f"⚠️ Volume check error for {symbol}: {e}")
-        skipped_signals += 1
-        return False
-
-    # Cooldown check
-    if last_trade_time.get(symbol, 0) > now:
-        cooldown_left = last_trade_time[symbol] - now
-        print(f"⏰ COOLDOWN: {symbol} - {cooldown_left:.0f}s remaining")
-        skipped_signals += 1
-        return False
-
-    # Global open-trade limits
-    open_trade_count = len([t for t in open_trades if t.get("st") == "open"])
-    if open_trade_count >= MAX_OPEN_TRADES:
-        print(f"📊 MAX TRADES: {open_trade_count}/{MAX_OPEN_TRADES} - Skipping {symbol}")
-        skipped_signals += 1
-        return False
+    if ob_zone:
+        ob_type = ob_zone["type"]
+        if ob_type=="bullish" and last["close"] <= ob_zone["high"]: score+=1; reasons.append("Zone Approach +1")
+        elif ob_type=="bearish" and last["close"] >= ob_zone["low"]: score+=1; reasons.append("Zone Approach +1")
+        else: reasons.append("Zone Approach +0")
     else:
-        print(f"📊 TRADES: {open_trade_count}/{MAX_OPEN_TRADES} open")
+        reasons.append("Zone Approach +0"); ob_type=None
 
-    # 🔥 USE ONLY ROMEOPTP SIGNAL GENERATION - NO LEGACY SCORING
-    print(f"🎯 ROMEOPTP SCANNING {symbol}...")
-    try:
-        return generate_signal(symbol)
-    except Exception as e:
-        print(f"❌ ERROR in generate_signal for {symbol}: {e}")
-        import traceback
-        print(f"🔧 Stack trace: {traceback.format_exc()}")
-        return False
+    # Step 5: HTF Alignment
+    # ==== CHANGE 3: UPDATED HTF MAPPING FOR BYBIT TIMEFRAMES ====
+    tf_map = {
+        "30m": "1h",
+        "1h": "2h", 
+        "2h": "3h",
+        "3h": "4h",
+        "4h": "6h"
+    }
+    htf = tf_map.get(tf, "1h")
+    ohlcv_htf = await fetch_ohlcv(exchange, symbol, htf, 50)
+    htf_alignment = 0
+    if ohlcv_htf:
+        df_htf = pd.DataFrame(ohlcv_htf, columns=["ts","open","high","low","close","vol"])
+        trend = df_htf["close"].iloc[-1] - df_htf["close"].iloc[-5]
+        htf_dir = "bullish" if trend>0 else "bearish"
+        if ob_type and htf_dir==ob_type:
+            score+=1; htf_alignment=1; reasons.append(f"HTF ({htf}) Alignment +1")
+        else:
+            reasons.append(f"HTF ({htf}) Alignment +0")
+    else:
+        reasons.append("HTF Alignment ?")
 
-# ===== LOGGING FUNCTIONS =====
-def init_csv():
-    """Initialize the CSV log file with headers"""
-    if not os.path.exists(LOG_CSV):
-        with open(LOG_CSV, "w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow([
-                "timestamp_utc", "symbol", "side", "entry", "tp1", "tp2", "tp3", "sl",
-                "tf", "units", "margin_usd", "exposure_usd", "risk_pct", "confidence_pct", "status", "breakdown"
-            ])
-        print(f"✅ CSV log initialized: {LOG_CSV}")
+    # Step 6: Momentum
+    momentum_ratio = abs(last["close"]-last["open"])/(last["high"]-last["low"]+1e-8)
+    if ob_type=="bullish" and momentum_ratio>0.5 and last["close"]>last["open"]:
+        score+=1; reasons.append("Momentum +1")
+    elif ob_type=="bearish" and momentum_ratio>0.5 and last["close"]<last["open"]:
+        score+=1; reasons.append("Momentum +1")
+    else:
+        reasons.append("Momentum +0")
 
-def log_signal(row):
-    """Log a signal to CSV"""
-    try:
-        with open(LOG_CSV, "a", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(row)
-    except Exception as e:
-        print("log_signal error:", e)
+    if not ob_type: return None
+    side = "BUY" if ob_type=="bullish" else "SELL"
+    entry = float(last["close"])
 
-def log_trade_close(trade):
-    """Log trade closure to CSV"""
-    try:
-        with open(LOG_CSV, "a", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow([
-                datetime.utcnow().isoformat(), trade["s"], trade["side"], trade.get("entry"),
-                trade.get("tp1"), trade.get("tp2"), trade.get("tp3"), trade.get("sl"),
-                trade.get("entry_tf"), trade.get("units"), trade.get("margin"), trade.get("exposure"),
-                trade.get("risk_pct")*100 if trade.get("risk_pct") else None, trade.get("confidence_pct"),
-                trade.get("st"), "Romeoptp_Closed"
-            ])
-    except Exception as e:
-        print("log_trade_close error:", e)
-
-# ===== STARTUP =====
-init_csv()
-send_message("🚀 ROMEOPTP LIQUIDITY MANIPULATION ENGINE DEPLOYED\n"
-             "🎯 Pure Price-Based Analysis | No EMA/Trend Filters\n"
-             "🔧 CRT + Turtle Soup + BOS/MSS + Order Blocks\n"
-             "⚡ Liquidity Targeting & Sweep Detection Active\n"
-             "📊 Detailed Logging Enabled - Monitoring 70 Symbols")
-
-try:
-    SYMBOLS = get_top_symbols(70)
-    print(f"🚀 ROMEOPTP ENGINE STARTED")
-    print(f"📊 Monitoring {len(SYMBOLS)} symbols")
-    print(f"🎯 Timeframes: {', '.join(TIMEFRAMES)}")
-    print(f"🔧 Pure Price Manipulation Analysis")
-    print(f"📈 Detailed logging enabled")
-    print(f"{'='*60}")
+    # ---------------- CRITICAL FILTERS ----------------
+    critical_score = htf_alignment + liquidity_sweep
+    if critical_score < CRITICAL_FACTORS_MIN: return None
+    if score < MIN_SCORE: return None
+    if not has_disp: return None
     
-    # ADD THIS DELAY TO SHOW DEPLOYMENT IS WORKING
-    print("⏳ Starting main loop in 3 seconds...")
-    time.sleep(3)
+    # ---------------- NEW: HTF ALIGNMENT MANDATORY FILTER ----------------
+    if htf_alignment != 1:  # MUST HAVE HTF Alignment = 1
+        return None
+
+    market_regime = await detect_market_regime(df)
+    if (market_regime=="BULL" and side=="SELL") or (market_regime=="BEAR" and side=="BUY"): return None
+
+    trend_ma = df["close"].rolling(20).mean().iloc[-1]
+    if (side=="BUY" and last["close"]<trend_ma) or (side=="SELL" and last["close"]>trend_ma): return None
+
+    # ---------------- ELITE MTF CONFIRMATION ----------------
+    if not await elite_tf_alignment(exchange, symbol, side):
+        return None
+    reasons.append("Elite MTF Alignment ✅")
+
+    sig = {"symbol":symbol,"side":side,"entry":entry,"score":score,"reason":"RomeOPT 6-Step",
+           "reason_list":reasons,"htf_alignment":htf_alignment,"liquidity_sweep":liquidity_sweep}
+    sig = update_tp_sl_live(sig, df)
     
-except Exception as e:
-    SYMBOLS = ["BTCUSDT","ETHUSDT"]
-    print("Warning retrieving top symbols, defaulting to BTCUSDT & ETHUSDT.")
-
-# ===== MAIN LOOP =====
-cycle_count = 0
-while True:
-    try:
-        cycle_count += 1
-        print(f"\n🔄 CYCLE {cycle_count} STARTED at {datetime.utcnow().strftime('%H:%M:%S UTC')}")
+    # ==== CHANGE 4: ENHANCED TP/SL VALIDATION ====
+    if sig and "sl" in sig and "tp1" in sig:
+        risk = abs(sig["entry"] - sig["sl"])
+        tp1_distance = abs(sig["tp1"] - sig["entry"])
         
-        # Check for BTC volatility spikes
-        if btc_volatility_spike():
-            volatility_pause_until = time.time() + VOLATILITY_PAUSE
-            send_message(f"⚠️ BTC volatility spike detected — pausing signals for {VOLATILITY_PAUSE//60} minutes.")
-            print(f"⚠️ BTC volatility spike – pausing until {datetime.fromtimestamp(volatility_pause_until)}")
-
-        # Scan all symbols for Romeoptp setups
-        for i, sym in enumerate(SYMBOLS, start=1):
-            print(f"\n{'='*60}")
-            print(f"[{i}/{len(SYMBOLS)}] 🎯 ROMEOPTP SCANNING {sym}")
-            print(f"{'='*60}")
-            try:
-                analyze_symbol(sym)
-            except Exception as e:
-                print(f"⚠️ Error scanning {sym}: {e}")
-            time.sleep(API_CALL_DELAY)
-
-        # Check open trades for TP/SL
-        check_trades()
-
-        # Periodic maintenance
-        now = time.time()
-        if now - last_heartbeat > 43200:  # 12 hours
-            heartbeat()
-            last_heartbeat = now
-        if now - last_summary > 86400:    # 24 hours
-            summary()
-            last_summary = now
-
-        print(f"\n✅ Cycle {cycle_count} completed at {datetime.utcnow().strftime('%H:%M:%S UTC')}")
-        print(f"⏳ Waiting {CHECK_INTERVAL} seconds for next cycle...")
-        time.sleep(CHECK_INTERVAL)
+        # Reject if TP1 is less than minimum ratio of risk
+        if tp1_distance < risk * MIN_TP_DISTANCE_RATIO:
+            return None
         
-    except Exception as e:
-        print(f"❌ Main loop error: {e}")
-        print("🔄 Restarting main loop in 10 seconds...")
-        time.sleep(10)
+        # Calculate risk/reward ratio
+        rr_ratio = tp1_distance / risk if risk > 0 else 0
+        sig["rr_ratio"] = rr_ratio
+        
+        # Reject if risk/reward ratio is too low
+        if rr_ratio < MIN_RR_RATIO:
+            return None
+    
+    return sig
+
+# ---------------- TP/SL HELPERS ----------------
+def romeopt_tp_sl(entry, side, atr_val, ob_zone, df):
+    """
+    OPTIMIZED TP/SL using market structure + ATR
+    - Enhanced for Bybit volatility
+    - Proper risk/reward ratios
+    - Maintains all your elite logic
+    """
+    recent_high = df['high'].iloc[-10:].max()
+    recent_low = df['low'].iloc[-10:].min()
+
+    if side == "BUY":
+        # Calculate SL using conservative approach
+        sl_ob = ob_zone["low"] - (atr_val * 0.3)
+        sl_structure = recent_low - (atr_val * 0.3)
+        sl = min(sl_ob, sl_structure)
+        
+        risk = entry - sl
+        
+        # Ensure minimum meaningful risk for Bybit
+        min_risk = atr_val * 0.8  # Increased for Bybit volatility
+        if risk < min_risk:
+            risk = min_risk
+            sl = entry - risk
+        
+        # Calculate TP levels with proper spacing
+        base_tp1 = entry + (risk * 1.2)  # 1.2:1 RR
+        base_tp2 = entry + (risk * 2.0)  # 2.0:1 RR  
+        base_tp3 = entry + (risk * 3.0)  # 3.0:1 RR
+        
+        # Get market structure levels
+        nearest_resistance = df['high'].tail(20).max()
+        major_resistance = df['high'].tail(50).max()
+        
+        # Choose better profit level (calculated vs structure)
+        tp1 = min(base_tp1, nearest_resistance) if nearest_resistance > entry else base_tp1
+        tp2 = min(base_tp2, major_resistance) if major_resistance > tp1 else base_tp2
+        tp3 = base_tp3
+        
+        # Ensure proper ordering with meaningful distances
+        min_tp_gap = risk * 0.4  # Increased for Bybit
+        
+        tp1 = max(tp1, entry + (risk * 0.8))  # At least 0.8R profit
+        tp2 = max(tp2, tp1 + min_tp_gap)
+        tp3 = max(tp3, tp2 + min_tp_gap)
+        
+    else:  # SELL
+        # Calculate SL using conservative approach
+        sl_ob = ob_zone["high"] + (atr_val * 0.3)
+        sl_structure = recent_high + (atr_val * 0.3)
+        sl = max(sl_ob, sl_structure)
+        
+        risk = sl - entry
+        
+        # Ensure minimum meaningful risk for Bybit
+        min_risk = atr_val * 0.8
+        if risk < min_risk:
+            risk = min_risk
+            sl = entry + risk
+        
+        # Calculate TP levels with proper spacing
+        base_tp1 = entry - (risk * 1.2)
+        base_tp2 = entry - (risk * 2.0)
+        base_tp3 = entry - (risk * 3.0)
+        
+        # Get market structure levels
+        nearest_support = df['low'].tail(20).min()
+        major_support = df['low'].tail(50).min()
+        
+        # Choose better profit level
+        tp1 = max(base_tp1, nearest_support) if nearest_support < entry else base_tp1
+        tp2 = max(base_tp2, major_support) if major_support < tp1 else base_tp2
+        tp3 = base_tp3
+        
+        # Ensure proper ordering with meaningful distances
+        min_tp_gap = risk * 0.4
+        
+        tp1 = min(tp1, entry - (risk * 0.8))
+        tp2 = min(tp2, tp1 - min_tp_gap)
+        tp3 = min(tp3, tp2 - min_tp_gap)
+
+    return sl, tp1, tp2, tp3
+
+def find_latest_ob(df: pd.DataFrame):
+    for i in range(len(df)-5, len(df)-1):
+        candle, prev_candle = df.iloc[i], df.iloc[i-1]
+        if candle["close"]>candle["open"] and prev_candle["close"]<prev_candle["open"]:
+            return {"type":"bullish","low":min(candle["low"], prev_candle["low"]),"high":candle["close"]}
+        elif candle["close"]<candle["open"] and prev_candle["close"]>prev_candle["open"]:
+            return {"type":"bearish","low":candle["close"],"high":max(candle["high"], prev_candle["high"])}
+    return None
+
+def update_tp_sl_live(sig: dict, df: pd.DataFrame):
+    latest_ob = find_latest_ob(df)
+    if not latest_ob: return sig
+    atr_val = float(atr(df,14).iloc[-1])
+    entry = sig["entry"]
+    side = sig["side"]
+    sl,tp1,tp2,tp3 = romeopt_tp_sl(entry, side, atr_val, latest_ob, df)
+    sig["sl"]=sl; sig["tp1"]=tp1; sig["tp2"]=tp2; sig["tp3"]=tp3
+    sig["latest_ob"]=latest_ob
+    return sig
+
+# ---------------- SL CLUSTER ----------------
+recent_sl = defaultdict(lambda: deque())
+def record_sl_hit(symbol: str, lookback_minutes=30):
+    now = time.time(); dq = recent_sl[symbol]; dq.append(now)
+    cutoff = now - lookback_minutes*60
+    while dq and dq[0]<cutoff: dq.popleft()
+def deprioritized(symbol: str, threshold=3, lookback=30):
+    dq = recent_sl[symbol]; now=time.time(); cutoff=now-lookback*60
+    while dq and dq[0]<cutoff: dq.popleft()
+    return len(dq)>=threshold
+
+# ---------------- LOG SIGNAL ----------------
+async def log_signal(sig):
+    async with db_lock:
+        await db_conn.execute("""
+            INSERT INTO signals (symbol,side,entry,sl,tp1,tp2,tp3,timestamp,status,reason,score,latest_ob,rr_ratio)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (sig["symbol"],sig["side"],sig["entry"],sig.get("sl"),sig.get("tp1"),sig.get("tp2"),sig.get("tp3"),
+              datetime.datetime.utcnow().isoformat(),"OPEN",sig["reason"],sig["score"],str(sig.get("latest_ob","")),
+              sig.get("rr_ratio", 0)))
+        await db_conn.commit()
+
+# ---------------- MONITOR SIGNALS ----------------
+async def monitor_signals():
+    while True:
+        try:
+            async with db_lock:
+                async with db_conn.execute("SELECT id,symbol,side,entry,sl,tp1,tp2,tp3,tp1_hit,tp2_hit,tp3_hit,status FROM signals WHERE status='OPEN'") as cursor:
+                    async for row in cursor:
+                        sig_id, symbol, side, entry, sl, tp1, tp2, tp3, tp1_hit, tp2_hit, tp3_hit, status = row
+                        ticker = await exchange.fetch_ticker(symbol)
+                        last_price = ticker.get("last")
+                        if last_price is None: continue
+
+                        ohlcv = await fetch_ohlcv(exchange, symbol, "30m", 50)
+                        if ohlcv:
+                            df_live = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","vol"])
+                            for c in ["open","high","low","close","vol"]: df_live[c]=pd.to_numeric(df_live[c],errors="coerce")
+                            sig = {"symbol":symbol,"side":side,"entry":entry,"sl":sl,"tp1":tp1,"tp2":tp2,"tp3":tp3}
+                            sig = update_tp_sl_live(sig, df_live)
+                            sl,tp1,tp2,tp3 = sig["sl"], sig["tp1"], sig["tp2"], sig["tp3"]
+
+                        hits=[]; sl_hit=False
+                        if side=="BUY":
+                            if not tp1_hit and last_price>=tp1: hits.append("TP1"); tp1_hit=1
+                            if not tp2_hit and last_price>=tp2: hits.append("TP2"); tp2_hit=1
+                            if not tp3_hit and last_price>=tp3: hits.append("TP3"); tp3_hit=1
+                            if last_price<=sl: hits.append("SL"); status="CLOSED"; sl_hit=True
+                        else:
+                            if not tp1_hit and last_price<=tp1: hits.append("TP1"); tp1_hit=1
+                            if not tp2_hit and last_price<=tp2: hits.append("TP2"); tp2_hit=1
+                            if not tp3_hit and last_price<=tp3: hits.append("TP3"); tp3_hit=1
+                            if last_price>=sl: hits.append("SL"); status="CLOSED"; sl_hit=True
+
+                        if hits:
+                            await tg(f"🎯 {symbol} {side} update\nEntry:{entry}\nLast:{last_price}\nHits:{','.join(hits)}\nSL:{sl}\nTP1:{tp1} TP2:{tp2} TP3:{tp3}")
+
+                        if sl_hit: record_sl_hit(symbol)
+                        await db_conn.execute("UPDATE signals SET tp1_hit=?,tp2_hit=?,tp3_hit=?,status=? WHERE id=?",
+                                             (tp1_hit,tp2_hit,tp3_hit,status,sig_id))
+                await db_conn.commit()
+        except Exception as e: log.exception("monitor error: %s", e)
+        await asyncio.sleep(SCAN_INTERVAL)
+
+# ---------------- SCAN LOOP ----------------
+last_signal_time = {}
+async def scan_loop(exchange):
+    while True:
+        t0=time.time()
+        try:
+            tickers = await exchange.fetch_tickers()
+            top = sorted([(s,v.get("quoteVolume",0)) for s,v in tickers.items() if s.endswith("USDT")], key=lambda x:x[1], reverse=True)[:TOP_N]
+            signals_found = 0
+            for symbol,_ in top:
+                if deprioritized(symbol): continue
+                for tf in TIMEFRAMES:
+                    key=f"{symbol}:{tf}"
+                    if key in last_signal_time and time.time()-last_signal_time[key]<60: continue
+                    ohlcv = await fetch_ohlcv(exchange,symbol,tf,200)
+                    if not ohlcv: continue
+                    df=pd.DataFrame(ohlcv,columns=["ts","open","high","low","close","vol"])
+                    for c in ["open","high","low","close","vol"]: df[c]=pd.to_numeric(df[c],errors="coerce")
+                    sig = await generate_signal_romeopt(exchange,df,symbol,tf)
+                    if sig:
+                        htf_flag = sig.get("htf_alignment", "N/A")
+                        sweep_flag = sig.get("liquidity_sweep", "N/A")
+                        rr_ratio = sig.get("rr_ratio", 0)
+                        await tg(f"🏆 {sig['symbol']} ({tf}) {sig['side']}\nEntry:{sig['entry']}\nSL:{sig.get('sl')}\nTP1:{sig.get('tp1')} TP2:{sig.get('tp2')} TP3:{sig.get('tp3')}\nScore:{sig['score']}\nHTF:{htf_flag} Sweep:{sweep_flag} RR:{rr_ratio:.2f}:1\nBreakdown:{', '.join(sig['reason_list'])}")
+                        await log_signal(sig)
+                        last_signal_time[key]=time.time()
+                        signals_found+=1
+            log.info(f"📊 Scan complete: {signals_found} RomeOPT signals found")
+        except Exception as e: log.exception("scan error: %s", e)
+        elapsed=time.time()-t0
+        await asyncio.sleep(max(1,SCAN_INTERVAL-elapsed))
+
+# ---------------- FASTAPI ----------------
+app = FastAPI()
+@app.post("/webhook")
+async def webhook(request: Request):
+    token = request.headers.get("X-Auth","")
+    if token!=WEBHOOK_SECRET: raise HTTPException(403,"Invalid secret")
+    data = await request.json()
+    log.info("Webhook received: %s", data)
+    return {"ok":True}
+
+# ---------------- MAIN ----------------
+async def main():
+    await init_db()
+    global exchange
+    # ==== CHANGE 5: SWITCH TO BYBIT EXCHANGE ====
+    exchange = ccxt.bybit({
+        'enableRateLimit': True,
+        'options': {
+            'defaultType': 'spot',  # or 'future' for futures
+        }
+    })
+    await tg("🏆 ROMEOPT 6-Step Scanner Started - Bybit Edition")
+    await asyncio.gather(scan_loop(exchange), monitor_signals())
+
+if __name__=="__main__":
+    import argparse
+    p=argparse.ArgumentParser()
+    p.add_argument("--http", action="store_true")
+    args=p.parse_args()
+    if args.http:
+        uvicorn.run(app, host="0.0.0.0", port=9000)
+    else:
+        try:
+            asyncio.run(main())
+        finally:
+            if db_conn:
+                asyncio.run(db_conn.close())
