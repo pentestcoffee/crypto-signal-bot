@@ -29,7 +29,9 @@ from collections import defaultdict, deque
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "changeme")
-DB_PATH = "/app/data/signals.db"
+
+# ==== FIX FOR RENDER.COM: Use /tmp for database ====
+DB_PATH = os.getenv("DB_PATH", "/tmp/signals.db")
 
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 10))
 TOP_N = int(os.getenv("TOP_N", 60))
@@ -69,8 +71,10 @@ async def tg(msg: str):
 async def init_db():
     global db_conn
     try:
-        # Ensure directory exists
-        os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+        # ==== FIX FOR RENDER.COM: Use current directory instead of /app ====
+        db_dir = os.path.dirname(DB_PATH)
+        if db_dir and not os.path.exists(db_dir):
+            os.makedirs(db_dir, exist_ok=True)
         
         db_conn = await aiosqlite.connect(DB_PATH)
         await db_conn.execute("PRAGMA journal_mode=WAL;")
@@ -111,7 +115,7 @@ async def init_db():
                 await db_conn.execute("ALTER TABLE signals ADD COLUMN rr_ratio REAL")
         
         await db_conn.commit()
-        log.info("Database initialized successfully")
+        log.info(f"Database initialized successfully at {DB_PATH}")
     except Exception as e:
         log.error(f"Database initialization failed: {e}")
         raise
@@ -546,19 +550,29 @@ async def main():
             await exchange.close()
 
 if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--http", action="store_true", help="Run HTTP server")
-    args = parser.parse_args()
+    # For Render.com, you need to run it as a web service
+    # Set PORT environment variable from Render
+    port = int(os.getenv("PORT", 9000))
     
-    if args.http:
-        uvicorn.run(app, host="0.0.0.0", port=9000, log_level="info")
+    # If running on Render, start the web server
+    if os.getenv("RENDER", "false").lower() == "true":
+        log.info(f"🚀 Starting web server on port {port}")
+        uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
     else:
-        try:
-            asyncio.run(main())
-        except KeyboardInterrupt:
-            print("\nBot stopped by user")
-            exit(0)
-        except Exception as e:
-            print(f"Fatal error: {e}")
-            exit(1)
+        # For local development
+        import argparse
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--http", action="store_true", help="Run HTTP server")
+        args = parser.parse_args()
+        
+        if args.http:
+            uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
+        else:
+            try:
+                asyncio.run(main())
+            except KeyboardInterrupt:
+                print("\nBot stopped by user")
+                exit(0)
+            except Exception as e:
+                print(f"Fatal error: {e}")
+                exit(1)
