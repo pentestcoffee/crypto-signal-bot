@@ -48,6 +48,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
 log = logging.getLogger("romeopt_bot")
 db_lock = asyncio.Lock()
 db_conn = None
+exchange = None  # Global exchange object
 
 # ---------------- TELEGRAM ----------------
 def escape_html(msg: str) -> str:
@@ -67,31 +68,53 @@ async def tg(msg: str):
 # ---------------- DATABASE ----------------
 async def init_db():
     global db_conn
-    db_conn = await aiosqlite.connect(DB_PATH)
-    await db_conn.execute("PRAGMA journal_mode=WAL;")
-    await db_conn.execute("PRAGMA synchronous=NORMAL;")
-    await db_conn.execute("""
-        CREATE TABLE IF NOT EXISTS signals (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            symbol TEXT,
-            side TEXT,
-            entry REAL,
-            sl REAL,
-            tp1 REAL,
-            tp2 REAL,
-            tp3 REAL,
-            timestamp TEXT,
-            status TEXT,
-            reason TEXT,
-            score INTEGER,
-            tp1_hit INTEGER DEFAULT 0,
-            tp2_hit INTEGER DEFAULT 0,
-            tp3_hit INTEGER DEFAULT 0,
-            latest_ob TEXT,
-            rr_ratio REAL  # Added for risk/reward tracking
-        );
-    """)
-    await db_conn.commit()
+    try:
+        # Ensure directory exists
+        os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+        
+        db_conn = await aiosqlite.connect(DB_PATH)
+        await db_conn.execute("PRAGMA journal_mode=WAL;")
+        await db_conn.execute("PRAGMA synchronous=NORMAL;")
+        
+        # Check if table exists and add rr_ratio column if needed
+        cursor = await db_conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='signals'")
+        table_exists = await cursor.fetchone()
+        
+        if not table_exists:
+            await db_conn.execute("""
+                CREATE TABLE signals (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    symbol TEXT,
+                    side TEXT,
+                    entry REAL,
+                    sl REAL,
+                    tp1 REAL,
+                    tp2 REAL,
+                    tp3 REAL,
+                    timestamp TEXT,
+                    status TEXT,
+                    reason TEXT,
+                    score INTEGER,
+                    tp1_hit INTEGER DEFAULT 0,
+                    tp2_hit INTEGER DEFAULT 0,
+                    tp3_hit INTEGER DEFAULT 0,
+                    latest_ob TEXT,
+                    rr_ratio REAL
+                );
+            """)
+        else:
+            # Check if rr_ratio column exists
+            cursor = await db_conn.execute("PRAGMA table_info(signals)")
+            columns = await cursor.fetchall()
+            column_names = [col[1] for col in columns]
+            if 'rr_ratio' not in column_names:
+                await db_conn.execute("ALTER TABLE signals ADD COLUMN rr_ratio REAL")
+        
+        await db_conn.commit()
+        log.info("Database initialized successfully")
+    except Exception as e:
+        log.error(f"Database initialization failed: {e}")
+        raise
 
 # ---------------- OHLCV ----------------
 async def fetch_ohlcv(exchange, symbol: str, timeframe: str, limit=200):
@@ -393,9 +416,12 @@ async def monitor_signals():
                 async with db_conn.execute("SELECT id,symbol,side,entry,sl,tp1,tp2,tp3,tp1_hit,tp2_hit,tp3_hit,status FROM signals WHERE status='OPEN'") as cursor:
                     async for row in cursor:
                         sig_id, symbol, side, entry, sl, tp1, tp2, tp3, tp1_hit, tp2_hit, tp3_hit, status = row
-                        ticker = await exchange.fetch_ticker(symbol)
-                        last_price = ticker.get("last")
-                        if last_price is None: continue
+                        try:
+                            ticker = await exchange.fetch_ticker(symbol)
+                            last_price = ticker.get("last")
+                            if last_price is None: continue
+                        except:
+                            continue
 
                         ohlcv = await fetch_ohlcv(exchange, symbol, "30m", 50)
                         if ohlcv:
@@ -424,7 +450,8 @@ async def monitor_signals():
                         await db_conn.execute("UPDATE signals SET tp1_hit=?,tp2_hit=?,tp3_hit=?,status=? WHERE id=?",
                                              (tp1_hit,tp2_hit,tp3_hit,status,sig_id))
                 await db_conn.commit()
-        except Exception as e: log.exception("monitor error: %s", e)
+        except Exception as e: 
+            log.error(f"Monitor error: {e}")
         await asyncio.sleep(SCAN_INTERVAL)
 
 # ---------------- SCAN LOOP ----------------
@@ -455,44 +482,83 @@ async def scan_loop(exchange):
                         last_signal_time[key]=time.time()
                         signals_found+=1
             log.info(f"📊 Scan complete: {signals_found} RomeOPT signals found")
-        except Exception as e: log.exception("scan error: %s", e)
+        except Exception as e: 
+            log.error(f"Scan error: {e}")
         elapsed=time.time()-t0
         await asyncio.sleep(max(1,SCAN_INTERVAL-elapsed))
 
 # ---------------- FASTAPI ----------------
 app = FastAPI()
+
+@app.get("/")
+async def root():
+    return {"status": "RomeOPT Bybit Scanner", "timeframes": TIMEFRAMES}
+
 @app.post("/webhook")
 async def webhook(request: Request):
     token = request.headers.get("X-Auth","")
-    if token!=WEBHOOK_SECRET: raise HTTPException(403,"Invalid secret")
+    if token!=WEBHOOK_SECRET: 
+        raise HTTPException(status_code=403, detail="Invalid secret")
     data = await request.json()
     log.info("Webhook received: %s", data)
     return {"ok":True}
 
 # ---------------- MAIN ----------------
 async def main():
-    await init_db()
-    global exchange
-    # ==== CHANGE 5: SWITCH TO BYBIT EXCHANGE ====
-    exchange = ccxt.bybit({
-        'enableRateLimit': True,
-        'options': {
-            'defaultType': 'spot',  # or 'future' for futures
-        }
-    })
-    await tg("🏆 ROMEOPT 6-Step Scanner Started - Bybit Edition")
-    await asyncio.gather(scan_loop(exchange), monitor_signals())
+    try:
+        # Initialize database
+        await init_db()
+        
+        # Initialize Bybit exchange
+        global exchange
+        exchange = ccxt.bybit({
+            'enableRateLimit': True,
+            'options': {
+                'defaultType': 'spot',
+            }
+        })
+        
+        # Test connection
+        await exchange.load_markets()
+        log.info("✅ Connected to Bybit successfully")
+        
+        await tg("🏆 ROMEOPT 6-Step Scanner Started - Bybit Edition\n📊 Timeframes: 30m, 1h, 2h, 3h, 4h")
+        
+        # Run both coroutines
+        scan_task = asyncio.create_task(scan_loop(exchange))
+        monitor_task = asyncio.create_task(monitor_signals())
+        
+        # Wait for both tasks
+        await asyncio.gather(scan_task, monitor_task)
+        
+    except KeyboardInterrupt:
+        log.info("Shutdown requested by user")
+    except Exception as e:
+        log.error(f"Fatal error in main: {e}")
+        await tg(f"❌ Bot crashed: {e}")
+        raise
+    finally:
+        # Cleanup
+        log.info("Cleaning up resources...")
+        if db_conn:
+            await db_conn.close()
+        if exchange:
+            await exchange.close()
 
-if __name__=="__main__":
+if __name__ == "__main__":
     import argparse
-    p=argparse.ArgumentParser()
-    p.add_argument("--http", action="store_true")
-    args=p.parse_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--http", action="store_true", help="Run HTTP server")
+    args = parser.parse_args()
+    
     if args.http:
-        uvicorn.run(app, host="0.0.0.0", port=9000)
+        uvicorn.run(app, host="0.0.0.0", port=9000, log_level="info")
     else:
         try:
             asyncio.run(main())
-        finally:
-            if db_conn:
-                asyncio.run(db_conn.close())
+        except KeyboardInterrupt:
+            print("\nBot stopped by user")
+            exit(0)
+        except Exception as e:
+            print(f"Fatal error: {e}")
+            exit(1)
