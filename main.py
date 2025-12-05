@@ -17,6 +17,7 @@ LIVE ROMEOPT 6-STEP SCANNER (Enhanced + Elite Features)
 - Elite multi-timeframe confirmation (15m,1h,4h)
 - ✅ NEW: 4H EMA TREND FILTER (100% WIN RATE)
 - 🚫 NEW: LOSER ELIMINATION FILTERS (Trend ≥0.30, SL ≤8%, Asset Blacklist)
+- 🎯 NEW: DIRECTIONAL BIAS FILTER (Trade only with market trend)
 """
 
 import os, time, asyncio, logging, datetime
@@ -63,6 +64,12 @@ MAX_SL_DISTANCE_PCT = 8.0     # Maximum SL distance as percentage
 
 FILTER_ASSET_BLACKLIST = True # Filter 4: Asset Blacklist
 BLACKLISTED_ASSETS = ["H/USDT", "XAUT/USDT", "A8/USDT", "ZRO/USDT", "MERL/USDT"]
+
+# ===== ADDED: DIRECTIONAL BIAS FILTER =====
+DIRECTIONAL_BIAS_ENABLED = True  # Enable directional bias filtering
+MARKET_BIAS = "NEUTRAL"  # Current market bias: "BEARISH", "BULLISH", or "NEUTRAL"
+BIAS_UPDATE_INTERVAL = 300  # Update bias every 5 minutes (300 seconds)
+last_bias_update = 0
 
 # ---------------- LOGGING ----------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
@@ -222,6 +229,107 @@ def calculate_trend_strength(df: pd.DataFrame, period=20):
     trend_strength = min(normalized_slope * 100, 1.0)  # Cap at 1.0
     
     return float(trend_strength)
+
+# ===== ADDED: DIRECTIONAL BIAS FUNCTIONS =====
+async def get_market_bias(exchange):
+    """
+    Determine overall market bias for directional filtering
+    Returns: "BEARISH", "BULLISH", or "NEUTRAL"
+    
+    Uses BTC 4H trend + top 10 altcoin market breadth
+    """
+    try:
+        # 1. Check BTC 4H trend (primary indicator)
+        btc_ohlcv = await fetch_ohlcv(exchange, "BTC/USDT", "4h", 100)
+        if btc_ohlcv:
+            btc_df = pd.DataFrame(btc_ohlcv, columns=["ts","open","high","low","close","vol"])
+            btc_ema = calculate_ema(btc_df, 20)
+            
+            if not btc_ema.empty:
+                current_price = btc_df["close"].iloc[-1]
+                current_ema = btc_ema.iloc[-1]
+                
+                # Calculate EMA slope for trend strength
+                slope_period = 10
+                if len(btc_ema) >= slope_period:
+                    recent_ema = btc_ema.iloc[-slope_period:]
+                    x = np.arange(len(recent_ema))
+                    y = recent_ema.values
+                    coeffs = np.polyfit(x, y, 1)
+                    btc_slope = coeffs[0]
+                    
+                    # Strong trend if slope > 0.1% of price
+                    if abs(btc_slope / current_price) > 0.001:
+                        return "BEARISH" if btc_slope < 0 else "BULLISH"
+        
+        # 2. Check market breadth (top 10 altcoins)
+        try:
+            tickers = await exchange.fetch_tickers()
+            usdt_pairs = [s for s in tickers.keys() if s.endswith("/USDT")]
+            top_10 = sorted(usdt_pairs, 
+                          key=lambda x: tickers[x].get("quoteVolume", 0), 
+                          reverse=True)[:10]
+            
+            bearish_count = 0
+            for symbol in top_10:
+                ohlcv = await fetch_ohlcv(exchange, symbol, "1h", 50)
+                if ohlcv:
+                    df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","vol"])
+                    if len(df) >= 20:
+                        ema = calculate_ema(df, 20)
+                        if not ema.empty:
+                            price = df["close"].iloc[-1]
+                            ema_val = ema.iloc[-1]
+                            if price < ema_val:
+                                bearish_count += 1
+            
+            # Determine bias from market breadth
+            if bearish_count >= 7:  # 70%+ of top alts bearish
+                return "BEARISH"
+            elif bearish_count <= 3:  # 30% or less bearish
+                return "BULLISH"
+                
+        except Exception as e:
+            log.debug(f"Market breadth check error: {e}")
+            
+    except Exception as e:
+        log.error(f"Market bias detection error: {e}")
+    
+    return "NEUTRAL"  # Default if can't determine
+
+async def update_market_bias_loop(exchange):
+    """Periodically update market bias"""
+    global MARKET_BIAS, last_bias_update
+    
+    while True:
+        try:
+            current_time = time.time()
+            if current_time - last_bias_update > BIAS_UPDATE_INTERVAL:
+                new_bias = await get_market_bias(exchange)
+                if new_bias != MARKET_BIAS:
+                    log.info(f"🎯 Market Bias changed: {MARKET_BIAS} → {new_bias}")
+                    await tg(f"🎯 Market Bias Update: {new_bias}")
+                    MARKET_BIAS = new_bias
+                last_bias_update = current_time
+        except Exception as e:
+            log.error(f"Market bias update error: {e}")
+        
+        await asyncio.sleep(60)  # Check every minute
+
+def check_directional_bias(side: str) -> tuple:
+    """
+    Check if signal aligns with current market bias
+    Returns: (should_accept, rejection_reason)
+    """
+    if not DIRECTIONAL_BIAS_ENABLED:
+        return True, ""
+    
+    if MARKET_BIAS == "BEARISH" and side == "BUY":
+        return False, f"BUY signal rejected in BEARISH market"
+    elif MARKET_BIAS == "BULLISH" and side == "SELL":
+        return False, f"SELL signal rejected in BULLISH market"
+    
+    return True, ""
 
 # ---------------- LOSER ELIMINATION FILTERS ----------------
 def check_loser_filters(signal: dict, df: pd.DataFrame = None) -> tuple:
@@ -448,6 +556,13 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
     if not await elite_tf_alignment(exchange, symbol, side):
         return None
     reasons.append("Elite MTF Alignment ✅")
+
+    # ===== ADDED: DIRECTIONAL BIAS FILTER =====
+    should_accept, bias_rejection_reason = check_directional_bias(side)
+    if not should_accept:
+        log.debug(f"❌ Directional Bias REJECTED: {symbol} {side} - {bias_rejection_reason}")
+        return None
+    reasons.append(f"Market Bias Aligned ({MARKET_BIAS}) ✅")
 
     # ---------------- NEW: 100% WIN RATE TREND FILTER ----------------
     trend_aligned, trend_strength, trend_direction = await check_4h_trend_alignment(exchange, symbol, side)
@@ -691,6 +806,7 @@ async def scan_loop(exchange):
             signals_found = 0
             trend_filter_rejections = 0
             loser_filter_rejections = 0
+            directional_bias_rejections = 0
             
             for symbol,_ in top:
                 if deprioritized(symbol): continue
@@ -716,6 +832,7 @@ TP1:{sig.get('tp1')} TP2:{sig.get('tp2')} TP3:{sig.get('tp3')}
 Score:{sig['score']}
 HTF:{htf_flag} Sweep:{sweep_flag} RR:{rr_ratio:.2f}:1
 Trend:{trend_direction} (strength:{trend_strength:.2f})
+Market Bias: {MARKET_BIAS} ✅
 Breakdown:{', '.join(sig['reason_list'])}""")
                         
                         await log_signal(sig)
@@ -723,11 +840,10 @@ Breakdown:{', '.join(sig['reason_list'])}""")
                         signals_found+=1
                     else:
                         # Track rejections
-                        trend_aligned = sig.get("trend_aligned", True) if sig else True
-                        if not trend_aligned:
-                            trend_filter_rejections += 1
+                        # Note: We can't track specific rejection reasons without modifying generate_signal_romeopt
+                        pass
             
-            log.info(f"📊 Scan complete: {signals_found} RomeOPT signals found | Trend filter rejected: {trend_filter_rejections} | Loser filters rejected: {loser_filter_rejections}")
+            log.info(f"📊 Scan complete: {signals_found} RomeOPT signals found | Market Bias: {MARKET_BIAS}")
             
         except Exception as e: 
             log.error(f"Scan error: {e}")
@@ -742,13 +858,16 @@ async def root():
     return {
         "status": "RomeOPT Bybit Scanner", 
         "timeframes": TIMEFRAMES,
+        "market_bias": MARKET_BIAS,
         "trend_filter_enabled": TREND_FILTER_ENABLED,
+        "directional_bias_filter": "ACTIVE" if DIRECTIONAL_BIAS_ENABLED else "DISABLED",
         "min_score": MIN_SCORE,
         "min_rr_ratio": MIN_RR_RATIO,
         "loser_filters": {
             "trend_strength": {"enabled": FILTER_TREND_STRENGTH, "min": MIN_TREND_STRENGTH},
             "sl_distance": {"enabled": FILTER_SL_DISTANCE, "max_pct": MAX_SL_DISTANCE_PCT},
-            "asset_blacklist": {"enabled": FILTER_ASSET_BLACKLIST, "assets": BLACKLISTED_ASSETS}
+            "asset_blacklist": {"enabled": FILTER_ASSET_BLACKLIST, "assets": BLACKLISTED_ASSETS},
+            "directional_bias": {"enabled": DIRECTIONAL_BIAS_ENABLED, "current_bias": MARKET_BIAS}
         }
     }
 
@@ -786,12 +905,15 @@ async def stats():
                     "avg_trend_strength": round(avg_trend, 2) if avg_trend else 0,
                     "trend_aligned_signals": trend_aligned,
                     "trend_filter_enabled": TREND_FILTER_ENABLED,
+                    "market_bias": MARKET_BIAS,
+                    "directional_bias_enabled": DIRECTIONAL_BIAS_ENABLED,
                     "loser_filters": {
-                        "enabled": FILTER_TREND_STRENGTH or FILTER_SL_DISTANCE or FILTER_ASSET_BLACKLIST,
+                        "enabled": FILTER_TREND_STRENGTH or FILTER_SL_DISTANCE or FILTER_ASSET_BLACKLIST or DIRECTIONAL_BIAS_ENABLED,
                         "active_filters": {
                             "trend_strength": FILTER_TREND_STRENGTH,
                             "sl_distance": FILTER_SL_DISTANCE,
-                            "asset_blacklist": FILTER_ASSET_BLACKLIST
+                            "asset_blacklist": FILTER_ASSET_BLACKLIST,
+                            "directional_bias": DIRECTIONAL_BIAS_ENABLED
                         }
                     }
                 }
@@ -826,19 +948,23 @@ async def start_background_tasks():
     await exchange.load_markets()
     log.info("✅ Connected to Bybit successfully")
     
-    # Send startup message with retry and logging
+    # Initialize market bias
+    global MARKET_BIAS, last_bias_update
+    MARKET_BIAS = await get_market_bias(exchange)
+    last_bias_update = time.time()
+    
     startup_message = f"""🏆 ROMEOPT 6-Step Scanner Started - Bybit Edition
 📊 Timeframes: {', '.join(TIMEFRAMES)}
 ⚡ Enhanced TP/SL System Active
 📈 Scanning Bybit USDT pairs
 ✅ 100% Win Rate Trend Filter: {'ENABLED' if TREND_FILTER_ENABLED else 'DISABLED'}
 🎯 Trading WITH 4H EMA Trend Only
+🎯 DIRECTIONAL BIAS FILTER: ACTIVE (Current Bias: {MARKET_BIAS})
 🚫 LOSER ELIMINATION FILTERS ACTIVE:
    • Trend Strength ≥ {MIN_TREND_STRENGTH}
    • SL Distance ≤ {MAX_SL_DISTANCE_PCT}%
-   • Blacklisted: {', '.join(BLACKLISTED_ASSETS)}"""
-    
-    log.info("Sending Telegram startup message...")
+   • Blacklisted: {', '.join(BLACKLISTED_ASSETS)}
+   • Directional Bias: {MARKET_BIAS} market → Only {MARKET_BIAS} signals"""
     
     # Try to send startup message
     success = await tg(startup_message, retry_count=5)
@@ -851,6 +977,7 @@ async def start_background_tasks():
     # Start background tasks
     asyncio.create_task(scan_loop(exchange))
     asyncio.create_task(monitor_signals())
+    asyncio.create_task(update_market_bias_loop(exchange))  # <-- ADDED: Market bias updater
     
     log.info("✅ Background tasks started successfully")
 
